@@ -6,3 +6,12 @@ date	area	type	description	file
 2026-10-01	repo	refactor	Migrated source path convention from src/ to kain/ across AGENTS.md and catalog.tsv. Scaffolded kain/ subsystem folders (core, tokenizer, tensor, model, flow, refinery, spike) and python/ orchestration directory.	AGENTS.md, catalog.tsv, kain/, python/, memory.tsv
 2026-10-01	scripts	build	Built scripts/memlog.exe via LLVM target for memory.tsv logging	scripts/memlog.kn,scripts/memlog.exe
 2026-10-01	repo	add	Added .gitignore to ignore .kain/ intermediates, *.exe binaries, and .cache	.gitignore
+2026-10-01	docs	update	Updated AGENTS.md with mandatory memory.tsv check-first rule, memlog.exe usage guide, and rule 11	AGENTS.md
+2026-10-01	docs	update	Added single-line TurboKain reference path (D:/TurboKain) in AGENTS.md for portable drive migration	AGENTS.md
+2026-10-01	research	add	Authored research_4_kain_semantics.md defining the go-to neural keyword stack across L0-L7	research/research_4_kain_semantics.md
+2026-10-01	docs	update	Updated AGENTS.md directory map to include research_4_kain_semantics.md	AGENTS.md
+2026-10-01	docs	vendor	Vendored docs/kain/SYSTEMS_PROGRAMMING.MD (The Metal Guide) and integrated Layer 0 metal primitives & CRUSHER pattern into research_4 and AGENTS.md	docs/kain/SYSTEMS_PROGRAMMING.MD,research/research_4_kain_semantics.md,AGENTS.md
+2026-10-01	docs	vendor	Vendored CRUSHER.kn, metal.kn, core_os.kn into docs/kain/examples/ and updated AGENTS.md	docs/kain/examples/CRUSHER.kn,docs/kain/examples/metal.kn,docs/kain/examples/core_os.kn,AGENTS.md
+2026-10-01	docs	update	Moved stdlib.kn to docs/kain/stdlib.kn and established Lean Stdlib Whitelist (9 modules) in AGENTS.md	docs/kain/stdlib.kn,AGENTS.md
+2026-10-01	docs	update	Added std::gpu and std::cuda to Tier-1 Lean Stdlib Whitelist in AGENTS.md and research_4	AGENTS.md,research/research_4_kain_semantics.md
+2026-10-01	repo	refactor	Adopted Flat Core Doctrine: consolidated all core modules into flat kain/core/ directory for clean deterministic amalgamation	kain/core/,AGENTS.md,catalog.tsv

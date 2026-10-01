@@ -11,10 +11,15 @@ Read this before touching code.
 > **6GB VRAM + 16–32GB System RAM**, with zero framework tax and sub-second
 > generation.
 >
+> **TurboKain reference path: `D:/TurboKain`** ← edit this one line per machine/build if it moves.
+> TurboKain next door is our production reference code ground truth: 30,000+ lines of real, shipped Kain code
+> across 26 instruments proving whole-program amalgamation (`kain amalgamate --raw`), AVX2 SIMD `converge` fast-lanes,
+> `alloc_zeroed(n+32, "Byte")` arena memory management, and 77x faster `kernel32` DMA IO.
+> When in doubt about syntax, system patterns, or real-world Kain architecture, inspect TurboKain code before guessing.
+> As codebases move or bounce around across drives, **this single line is the only path that ever needs updating**.
+>
 > **Sibling repos:**
-> - **TurboKain (`../TurboKain/`):** The 26-instrument digital signal processing engine.
->   TurboKain is the signal-processing ancestor: it proved the whole-program
->   amalgamation doctrine, 77x faster `kernel32` IO, and pure-Kain native `.exe` speed.
+> - **TurboKain (`D:/TurboKain`):** The reference production code truth (above).
 > - **Kain Compiler (`../kain/`):** The language compiler repo. Source of truth for
 >   the language runtime, stdlib, and benchmarks. Read-only reference — never edit it.
 
@@ -141,7 +146,11 @@ Agents do not guess syntax; learn from the organized vendor baseline under `docs
   - `docs/kain/KAIN_BY_EXAMPLE.md` — The language manual with compilable snippets for every feature.
   - `docs/kain/KEYWORDS.MD` — The 111-keyword dictionary and semantic layers in depth.
   - `docs/kain/SHADER_GPU.MD` — Full reference on compute shaders, uniform bindings, and GPU dispatch.
+  - `docs/kain/SYSTEMS_PROGRAMMING.MD` — **The Metal Guide**: 100KB bible on raw CPU/OS control — inline asm (`asm("pause")`, `clflush`), hardware fences (`lfence`/`sfence`/`mfence`), cache prefetching (`prefetch_read`), huge pages (`vm_allocate_huge`), NUMA pinning (`set_current_thread_affinity`), `comptime` lookup tables, and the full CRUSHER semantic fusion pattern. TurboKain only scratched the surface; `k_AI_n` taps this metal depth.
 - **Code Exemplars & Training:**
+  - `docs/kain/examples/CRUSHER.kn` — The semantic singularity benchmark fusing all 8 layers: `shatter struct`, `teleport`, `orchestrate`, `converge`, `world`/`entangle`, `std::actor`, `collapse`/`decay`, and hardware fences (`lfence`/`sfence`).
+  - `docs/kain/examples/metal.kn` — 12 raw metal benchmark cases: inline assembly (`asm("pause")`, `clflush`), CPUID/RDTSC intrinsics, virtual memory torture, thread affinity, and callconv dispatch (`@callconv("vectorcall")`).
+  - `docs/kain/examples/core_os.kn` — Direct OS syscalls, `std::os::mmap`, page protection, RAM locking (`mlock`), and file IO without C runtime bloat.
   - `docs/kain/training/kain_omni.kn` — One compilable file exercising all layers L0–L7, every effect, stdlib, actors, and telemetry.
   - `docs/kain/examples/fusion_chain.kn` — The definitive multi-layer causal chain voice.
   - `docs/kain/examples/sieve-pattern.kn` — Fast AVX2 `converge` spec pattern over memory buffers.
@@ -149,6 +158,10 @@ Agents do not guess syntax; learn from the organized vendor baseline under `docs
   - `docs/kain/_llm_proto_examples/` — Working Kain prototype implementations of tokenizers, transformers, search kernels, training routines, and config parsers.
   - `docs/kain/_gpu_cpu_examples/` — Real-world pipelines combining `orchestrate`, `converge`, `world`, `entangle`, and compute shaders.
   - `docs/kain/_shader_examples/` — Real-time compute and ray-marching shaders written natively in Kain.
+- **`docs/kain/stdlib.kn` — The Amalgamated Stdlib (Search truth here!):**
+  148 files / 146 modules packed into a single 1.54 MB raw amalgamation (~39,300 lines).
+  Need to see the exact implementation, signature, or return type of any stdlib function?
+  Grep this file directly: `grep -n "pub fn os_mlock" docs/kain/stdlib.kn` or `grep -n "pub fn popcount32" docs/kain/stdlib.kn`.
 - **`docs/kain/THE_MESSIAH.KN` — The Ultra File:**
   6,029 modules, ~795,000 lines, ~36 MB packed into a single searchable corpus.
   *Never `read` the whole file.* Grep it for production patterns (`grep -n "converge " docs/kain/THE_MESSIAH.KN`).
@@ -243,68 +256,68 @@ interconnected computational organism where **files and modules must connect lik
 
 ---
 
-## 4. Codebase Layout & 26-Module Inventory (`kain/`, NOT `src/`)
+## 4. The Flat Core Doctrine (`kain/core/`)
 
-> **CONVENTION NOTE ON `kain/` VS `src/`:**  
-> In this repository, **Kain source code lives in `kain/` — never `src/`**.  
-> The identifier `src/` gets lost in multimodal and multi-language context where every tool
-> and ecosystem claims "source". Following the TurboKain architecture, we identify Kain source
-> code explicitly as `kain/` — paving the way for scripting layers like `python/` for clean
-> separation of concerns (Kain computes, Python orchestrates/scripts).
+> **WHY FLAT BEATS MICRO-FOLDER SPRAWL:**  
+> Deep nested folder trees (`src/a/b/c/d/`) are the enemy of systems engineering: context gets fragmented
+> across dozens of editor tabs, relative imports drift, and developers lose track of zero-copy buffer lifecycles.  
+> Following the battle-tested TurboKain architecture, **all core neural modules live in a single, flat directory: `kain/core/`**.
+>
+> 1. **Zero navigation friction:** Every module is an immediate peer in `kain/core/`.
+> 2. **Deterministic ASCII Amalgamation:** `_common.kn` sorts first (`_` < `a`), guaranteeing all shared
+>    memory allocators, tensor descriptors, and assertions are declared before any module references them.
+> 3. **Clean One-Line Build:**
+>    ```bash
+>    kain amalgamate --raw kain/core -o kain/core.kn
+>    kain build kain/core.kn --target llvm -o kain/core.exe
+>    ```
 
 ```
-d:/k_AI_n/
+k_AI_n/ (repo root)
 ├── docs/                         # Language baseline & vendor guides
 │   └── kain/                     # Vendored Kain documentation corpus
 │       ├── tsv/                  # 36 LEAN lookup tables (keywords, stdlib, cli, shaders)
 │       ├── training/             # kain_omni.kn (all layers L0-L7), HoloGEHv2.md
-│       ├── examples/             # fusion_chain.kn, keyword_crucible.kn, sieve-pattern.kn
+│       ├── examples/             # CRUSHER.kn, metal.kn, core_os.kn, fusion_chain.kn, sieve-pattern.kn
 │       ├── _llm_proto_examples/  # LLM tokenizers, embeddings, transformers, search kernels
 │       ├── _gpu_cpu_examples/    # Heterogeneous GPU+CPU pipeline examples
 │       ├── _shader_examples/     # Standalone compute/graphics shaders
 │       ├── KAIN_BY_EXAMPLE.md    # Language tutorial & compilable snippets
 │       ├── KEYWORDS.MD           # 111 keywords & layer mappings
 │       ├── SHADER_GPU.MD         # Compute shader & GPU dispatch reference
+│       ├── SYSTEMS_PROGRAMMING.MD# Metal guide: asm, fences, prefetch, NUMA, huge pages, CRUSHER
+│       ├── stdlib.kn             # Single-file amalgamation of all 148 stdlib modules (grep target)
 │       └── THE_MESSIAH.KN        # 795k-line ultra reference corpus (grep only)
 │
 ├── research/                     # Architectural specifications & blueprints
 │   ├── spec.txt                  # Original greenfield vision
 │   ├── research_pilot_1.md       # Maximum ceiling architecture (14B-70B in 6GB VRAM)
 │   ├── research_training_2.md    # Scavenger King training protocol & token refinery
-│   └── research_3_structure.md   # 32k-line codebase engineering layout
+│   ├── research_3_structure.md   # 32k-line codebase engineering layout
+│   └── research_4_kain_semantics.md # The Go-To Neural Semantic Stack & Keyword Taxonomy
 │
-├── kain/                         # The 26 Core Modules (Pure Kain — NOT src/)
-│   ├── core/                     # Subsystem 1: Runtime, Memory, DMA & Dispatch
-│   │   ├── _common.kn            # Shared arena allocators, memory windows, assertions
+├── kain/                         # Pure Kain Source (NOT src/)
+│   ├── core/                     # FLAT Core Suite: All neural modules live here as peers
+│   │   ├── _common.kn            # Foundation: Arenas (+32 SIMD), memory windows, assertions
 │   │   ├── config.kn             # Hardware probe (VRAM, SIMD), architecture hyperparameters
 │   │   ├── dispatch.kn           # Multi-call CLI entry point (core chat/image/video/cartridge)
-│   │   └── mmap_loader.kn        # Zero-copy kernel32 DMA file streaming (77x faster IO)
-│   │
-│   ├── tokenizer/                # Subsystem 2: 16k Vocab & Transceiver
+│   │   ├── mmap_loader.kn        # Zero-copy kernel32 DMA file streaming (77x faster IO)
 │   │   ├── tokenizer_16k.kn      # 16,384-token English + Code byte-pair BPE tokenizer
 │   │   ├── transceiver_pack.kn   # Spoken language adapter & projection matrices
-│   │   └── prompt_steward.kn     # Sliding window context & AST special marker injector
-│   │
-│   ├── tensor/                   # Subsystem 3: Tensor Math & Zero-MatMul Suite
+│   │   ├── prompt_steward.kn     # Sliding window context & AST special marker injector
 │   │   ├── fwht_butterfly.kn     # O(N log N) Fast Walsh-Hadamard butterfly network
 │   │   ├── hadamard_sdm.kn       # 0.65-bit fractional weight entanglement decoder
 │   │   ├── gemm_158b.kn          # 1.58-bit ternary {-1, 0, +1} dot-product kernels
-│   │   └── activations.kn        # Fused RMSNorm, SwiGLU, RoPE, top-p/top-k nucleus sampler
-│   │
-│   ├── model/                    # Subsystem 4: Recurrent Hybrid & Equilibrium Model
+│   │   ├── activations.kn        # Fused RMSNorm, SwiGLU, RoPE, top-p/top-k nucleus sampler
 │   │   ├── ssm_liquid.kn         # O(1) continuous state-space recurrence (128MB context)
 │   │   ├── swa_attention.kn      # Local sliding-window attention (window = 1,024)
 │   │   ├── deq_equilibrium.kn    # Monotone Operator fixed-point solver (2-32 iterations)
 │   │   ├── moe_micro_basis.kn    # Combinatorial micro-expert router (C(512,8) states)
-│   │   └── cartridge_engine.kn   # Hot-swappable 15MB domain cartridge mounting (<1ms)
-│   │
-│   ├── flow/                     # Subsystem 5: Unified Multimodal Latent Flow Engine
+│   │   ├── cartridge_engine.kn   # Hot-swappable 15MB domain cartridge mounting (<1ms)
 │   │   ├── dcae_autoencoder.kn   # 32x Deep Compression Spatial Autoencoder (16x16x64 grid)
 │   │   ├── rectified_flow.kn     # 4-step straight-line ODE Euler integrator (0.8s images)
 │   │   ├── motion_wavelet.kn     # Temporal motion velocity vectors (10s video loops)
-│   │   └── render_png.kn         # Native zero-dependency PNG encoder & rasterizer
-│   │
-│   ├── refinery/                 # Subsystem 6: Scavenger Refinery & Distillation Suite
+│   │   ├── render_png.kn         # Native zero-dependency PNG encoder & rasterizer
 │   │   ├── entropy_screener.kn   # Shannon entropy / LZW complexity filter
 │   │   ├── ast_verifier.kn       # Compiler AST syntax validation gate
 │   │   ├── binary_packer.kn      # Contiguous 64-byte aligned .kain_bin tensor stream
@@ -334,8 +347,8 @@ kain check kain/core/_common.kn
 # Compile a standalone spike or test kernel:
 kain build kain/spike/kernel_test.kn --target llvm -o kernel_test.exe
 
-# Step 1: Pack modular source into a single unified whole-program translation unit:
-kain amalgamate --raw kain/core kain/tokenizer kain/tensor kain/model kain/flow -o kain/core.kn
+# Step 1: Pack the entire flat core suite into a single whole-program translation unit:
+kain amalgamate --raw kain/core -o kain/core.kn
 
 # Step 2: Compile via LLVM Whole-Program Optimization (WPO):
 kain build kain/core.kn --target llvm -o kain/core.exe
@@ -359,35 +372,91 @@ kain build kain/core.kn --target llvm -o kain/core.exe
 **Agents:** Never prepend `.kain/bin` or Bazel directories to PATH. `kain` is on PATH
 and works out of the box. If you see `failed to start bazel`, you ran `kaindev` by mistake.
 
-### Stdlib and Runtime Discovery
-Kain resolves standard library modules via:
-1. `KAIN_STDLIB_PATH`
-2. `$KAIN_HOME/stdlib` (e.g. `D:\kain\stdlib`)
-3. Ancestor paths of `kain.exe`
+### Stdlib and Runtime Discovery & The Lean Whitelist
 
-If an imported stdlib module reports `Unknown identifier`, it is an environment discovery
-issue, not missing syntax. Check `kain doctor`.
+Kain resolves standard library modules via `KAIN_STDLIB_PATH` and `$KAIN_HOME/stdlib` (e.g. `D:\kain\stdlib`).
+If an imported stdlib module reports `Unknown identifier`, it is an environment discovery issue, not missing syntax. Check `kain doctor`.
+
+#### The Lean Stdlib Whitelist (Don't Overwhelm with 71 Modules!)
+Kain ships with 71 standard library modules. **Do NOT drown agents in this ocean.**
+For building `k_AI_n`, **only 11 modules actually matter** — led by the GPU/CUDA accelerators:
+
+| Module | Why It Matters for `k_AI_n` | Key Symbols to Use |
+|---|---|---|
+| **`std::gpu`** | Portable compute shader pipeline, residency & buffer policies | `gpu_device_local_memory_policy`, `gpu_storage_buffer_binding`, `GPU_RESIDENCY_DEVICE_LOCAL` |
+| **`std::cuda`** | NVIDIA driver bridge, tensor/neural dispatch & warp intrinsics | `cuda_dispatch`, `CudaDispatchStats`, `CudaBindingLocator`, `cuda_tensor_binding` |
+| **`std::machine`** | CPU cache prefetching, hardware fences, NUMA, huge pages, cycles | `prefetch_read`, `lfence`, `sfence`, `vm_allocate_huge`, `rdtsc` |
+| **`std::os`** | Memory-mapping `.kain_bin` files, locking RAM, probing hardware | `os_mmap`, `os_mlock`, `os_ram_total`, `os_cpu_count` |
+| **`std::bits`** | Hardware bit manipulation for 1.58-bit ternary popcounts | `popcount32`, `clz32`, `ctz32`, `bswap32` |
+| **`std::simd`** | 256-bit SIMD vector types and lane operations | `I64x4`, lane add/sub/mask |
+| **`std::memory`** | Volatile access, pointer offset manipulation, memory fences | `volatile_load_int`, `load_fence`, `store_fence` |
+| **`std::atomic`** | Lockless thread synchronization, atomic flags | `atomic_load_int`, `atomic_store_int`, `atomic_compare_exchange` |
+| **`std::math`** | Fast transcendentals, vectors, matrices, float clamp | `sin`, `cos`, `sqrt`, `clamp`, `Vector4` |
+| **`std::bytes`** | Raw byte slice handling, binary packing | `ByteSlice`, `BytesBuilder` |
+| **`std::fs` / `std::path`** | Small file and path checks (manifests, cartridges) | `fs_exists`, `path_join`, `path_extension` |
+
+#### What to IGNORE (The Noise Filter):
+- ❌ **`std::no_std`**: Designed for bare-metal microcontroller kernels / RTOS. We are building a hosted 64-bit Windows binary with Vulkan/DirectX and kernel32 DMA. Do not import `no_std`.
+- ❌ **`std::mmio`**: Designed for device-driver register memory. 1.58-bit ternary bitplane unpacking is faster and cleaner with `std::bits` (`popcount32`) and raw shifts.
+- ❌ **`std::ui` / `std::graphics`**: Neural inference is headless. Leave UI out of the compute engine (`std::gpu` handles compute, `std::graphics` handles windows/renderpasses).
+- ❌ **`std::net` / `std::http` / `std::tls`**: The core binary is zero-network, sovereign local AI.
+- ❌ **`std::tar` / `std::zip` / `std::semver`**: Unnecessary build artifact formats.
+- ❌ **`std::tar` / `std::zip` / `std::semver`**: Unnecessary build artifact formats.
 
 ---
 
 ## 6. Ledgers — `memory.tsv` & `catalog.tsv`
 
-We maintain append-mostly ledgers to guarantee absolute provenance and prevent silent drift.
-**Update them as part of your change, not as an afterthought.**
+We maintain append-mostly ledgers to guarantee absolute provenance, continuity across agents,
+and prevent silent drift.
+
+### The Agent Ledger Workflow: CHECK FIRST, LOG AFTER
+
+> **CRITICAL RULE FOR ALL AGENTS:**  
+> 1. **CHECK FIRST:** Before touching code or planning an implementation, **inspect `memory.tsv`**
+>    (`read` or `grep`). See what previous agents built, tested, changed, or broke.
+>    Do not guess the state of the repo — the ground truth is in the ledger.
+> 2. **LOG AFTER:** Every file change (created, edited, moved, deleted) **must be logged immediately**
+>    using the native Kain helper `scripts/memlog.exe`. No silent edits.
+
+---
 
 ### `memory.tsv` — The Change Ledger
-Columns: `date  area  type  description  file` (tab-separated).
-- **Every file created, edited, moved, or deleted gets a row.**
-- `area`: subsystem (`core`, `tokenizer`, `tensor`, `model`, `flow`, `refinery`, `docs`, `build`)
+Columns: `date  area  type  description  file` (tab-separated, append-only).
+
+- `area`: Subsystem (`core`, `tokenizer`, `tensor`, `model`, `flow`, `refinery`, `docs`, `scripts`, `repo`, `build`)
 - `type`: `add`, `update`, `fix`, `build`, `verify`, `scaffold`, `refactor`
-- `description`: What changed and **why**, including the receipt/benchmark evidence.
+- `description`: What changed and **why**, including receipts or benchmark evidence.
 - `file`: Affected paths, comma-separated.
+
+#### How to Log: `scripts/memlog.exe`
+
+`scripts/memlog.kn` is compiled to a fast native binary at `scripts/memlog.exe`.
+It automatically stamps today's ISO date, sanitizes inputs so newlines or tabs can never corrupt the TSV, and appends to `memory.tsv`.
+
+```bash
+# General invocation (run from repo root):
+./scripts/memlog.exe <area> <type> "<description>" "<file1,file2>"
+
+# Examples:
+./scripts/memlog.exe tensor build "FWHT butterfly passes 1024-vector sanity in 12us" "kain/tensor/fwht_butterfly.kn"
+./scripts/memlog.exe tokenizer add "16k BPE vocab mapping with zero-copy arena buffers" "kain/tokenizer/tokenizer_16k.kn"
+./scripts/memlog.exe core fix "Added +32 SIMD padding to avoid AVX2 store overrun" "kain/core/_common.kn"
+```
+
+If you ever need to rebuild the helper:
+```bash
+cd scripts && kain build memlog.kn --target llvm -o memlog.exe && cd ..
+```
+
+---
 
 ### `catalog.tsv` — The Module & Kernel Ledger
 Columns: `module  source  target  status  receipt  notes  updated` (tab-separated).
 - Tracks status of each of the 26 modules (`draft` → `builds` → `proven` → `fused`).
+- **Check `catalog.tsv`** to see which kernels are drafted vs mathematically proven.
 - `status=proven` requires an actual test receipt (e.g. `108/108 checks green in 4ms`).
-  An empty receipt is unacceptable.
+  An empty receipt is unacceptable. Update this ledger whenever a module graduates.
 
 ---
 
@@ -424,6 +493,9 @@ Columns: `module  source  target  status  receipt  notes  updated` (tab-separate
 10. **Receipts for everything.**
     "It works" is not a status. A status is: "FWHT butterfly passes 1024-vector sanity check;
     0 diff against mathematical identity; executes in 12 microseconds."
+11. **Check memory.tsv before work; log with memlog.exe after.**
+    Never touch code without reading recent history in `memory.tsv`. Never finish a turn
+    without logging your file modifications with `./scripts/memlog.exe`. No silent edits.
 
 ---
 

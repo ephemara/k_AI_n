@@ -3,23 +3,23 @@ core	kain/core/_common.kn	llvm	draft	pending	Shared arena allocators, memory win
 config	kain/core/config.kn	llvm	draft	pending	Hardware capability probes and model hyperparameters	2026-10-01
 dispatch	kain/core/dispatch.kn	llvm	draft	pending	Multi-call entry point routing	2026-10-01
 mmap_loader	kain/core/mmap_loader.kn	llvm	draft	pending	Zero-copy kernel32 DMA file streaming	2026-10-01
-tokenizer_16k	kain/tokenizer/tokenizer_16k.kn	llvm	draft	pending	16k English + Code byte-pair BPE tokenizer	2026-10-01
-transceiver_pack	kain/tokenizer/transceiver_pack.kn	llvm	draft	pending	Modular spoken language adapters and projections	2026-10-01
-prompt_steward	kain/tokenizer/prompt_steward.kn	llvm	draft	pending	Sliding context window and AST marker injector	2026-10-01
-fwht_butterfly	kain/tensor/fwht_butterfly.kn	llvm	draft	pending	Fast Walsh-Hadamard Transform butterfly network	2026-10-01
-hadamard_sdm	kain/tensor/hadamard_sdm.kn	llvm	draft	pending	0.65-bit fractional weight entanglement decoder	2026-10-01
-gemm_158b	kain/tensor/gemm_158b.kn	llvm	draft	pending	1.58-bit ternary dot-product kernels	2026-10-01
-activations	kain/tensor/activations.kn	llvm	draft	pending	Fused RMSNorm, SwiGLU, RoPE, nucleus sampler	2026-10-01
-ssm_liquid	kain/model/ssm_liquid.kn	llvm	draft	pending	O(1) continuous state-space recurrence	2026-10-01
-swa_attention	kain/model/swa_attention.kn	llvm	draft	pending	Local sliding-window attention kernel	2026-10-01
-deq_equilibrium	kain/model/deq_equilibrium.kn	llvm	draft	pending	Monotone Operator fixed-point solver	2026-10-01
-moe_micro_basis	kain/model/moe_micro_basis.kn	llvm	draft	pending	Combinatorial micro-expert router	2026-10-01
-cartridge_engine	kain/model/cartridge_engine.kn	llvm	draft	pending	Hot-swappable 15MB domain cartridge mounting	2026-10-01
-dcae_autoencoder	kain/flow/dcae_autoencoder.kn	llvm	draft	pending	32x Deep Compression Spatial Autoencoder	2026-10-01
-rectified_flow	kain/flow/rectified_flow.kn	llvm	draft	pending	4-step straight-line ODE Euler integrator	2026-10-01
-motion_wavelet	kain/flow/motion_wavelet.kn	llvm	draft	pending	Temporal motion velocity vector field generator	2026-10-01
-render_png	kain/flow/render_png.kn	llvm	draft	pending	Native zero-dependency PNG encoder & rasterizer	2026-10-01
-entropy_screener	kain/refinery/entropy_screener.kn	llvm	draft	pending	Shannon entropy and LZW complexity filters	2026-10-01
-ast_verifier	kain/refinery/ast_verifier.kn	llvm	draft	pending	Syntax tree compiler validation gate	2026-10-01
-binary_packer	kain/refinery/binary_packer.kn	llvm	draft	pending	Contiguous 64-byte aligned .kain_bin packager	2026-10-01
-distill_loss	kain/refinery/distill_loss.kn	llvm	draft	pending	Invariant-weighted loss calculator	2026-10-01
+tokenizer_16k	kain/core/tokenizer_16k.kn	llvm	draft	pending	16k English + Code byte-pair BPE tokenizer	2026-10-01
+transceiver_pack	kain/core/transceiver_pack.kn	llvm	draft	pending	Modular spoken language adapters and projections	2026-10-01
+prompt_steward	kain/core/prompt_steward.kn	llvm	draft	pending	Sliding context window and AST marker injector	2026-10-01
+fwht_butterfly	kain/core/fwht_butterfly.kn	llvm	draft	pending	Fast Walsh-Hadamard Transform butterfly network	2026-10-01
+hadamard_sdm	kain/core/hadamard_sdm.kn	llvm	draft	pending	0.65-bit fractional weight entanglement decoder	2026-10-01
+gemm_158b	kain/core/gemm_158b.kn	llvm	draft	pending	1.58-bit ternary dot-product kernels	2026-10-01
+activations	kain/core/activations.kn	llvm	draft	pending	Fused RMSNorm, SwiGLU, RoPE, nucleus sampler	2026-10-01
+ssm_liquid	kain/core/ssm_liquid.kn	llvm	draft	pending	O(1) continuous state-space recurrence	2026-10-01
+swa_attention	kain/core/swa_attention.kn	llvm	draft	pending	Local sliding-window attention kernel	2026-10-01
+deq_equilibrium	kain/core/deq_equilibrium.kn	llvm	draft	pending	Monotone Operator fixed-point solver	2026-10-01
+moe_micro_basis	kain/core/moe_micro_basis.kn	llvm	draft	pending	Combinatorial micro-expert router	2026-10-01
+cartridge_engine	kain/core/cartridge_engine.kn	llvm	draft	pending	Hot-swappable 15MB domain cartridge mounting	2026-10-01
+dcae_autoencoder	kain/core/dcae_autoencoder.kn	llvm	draft	pending	32x Deep Compression Spatial Autoencoder	2026-10-01
+rectified_flow	kain/core/rectified_flow.kn	llvm	draft	pending	4-step straight-line ODE Euler integrator	2026-10-01
+motion_wavelet	kain/core/motion_wavelet.kn	llvm	draft	pending	Temporal motion velocity vector field generator	2026-10-01
+render_png	kain/core/render_png.kn	llvm	draft	pending	Native zero-dependency PNG encoder & rasterizer	2026-10-01
+entropy_screener	kain/core/entropy_screener.kn	llvm	draft	pending	Shannon entropy and LZW complexity filters	2026-10-01
+ast_verifier	kain/core/ast_verifier.kn	llvm	draft	pending	Syntax tree compiler validation gate	2026-10-01
+binary_packer	kain/core/binary_packer.kn	llvm	draft	pending	Contiguous 64-byte aligned .kain_bin packager	2026-10-01
+distill_loss	kain/core/distill_loss.kn	llvm	draft	pending	Invariant-weighted loss calculator	2026-10-01
