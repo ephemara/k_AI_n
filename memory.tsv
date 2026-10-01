@@ -1,0 +1,8 @@
+date	area	type	description	file
+2026-10-01	docs	add	Established AGENTS.md — comprehensive onboarding & operating rules for k_AI_n, detailing the Kain language substrate, the Alien N64 6GB VRAM multimodal engine goal, the connective glue architecture across 26 modules, and non-negotiable rules.	AGENTS.md
+2026-10-01	memory	add	Established memory.tsv change ledger following TurboKain append-mostly discipline.	memory.tsv
+2026-10-01	catalog	add	Established catalog.tsv module and kernel artifact ledger.	catalog.tsv
+2026-10-01	docs	update	Updated AGENTS.md with organized docs/kain/ tree and highlighted the 36 lean TSV lookup tables under docs/kain/tsv/ for instant, low-token agent syntax/stdlib retrieval.	AGENTS.md, memory.tsv
+2026-10-01	repo	refactor	Migrated source path convention from src/ to kain/ across AGENTS.md and catalog.tsv. Scaffolded kain/ subsystem folders (core, tokenizer, tensor, model, flow, refinery, spike) and python/ orchestration directory.	AGENTS.md, catalog.tsv, kain/, python/, memory.tsv
+2026-10-01	scripts	build	Built scripts/memlog.exe via LLVM target for memory.tsv logging	scripts/memlog.kn,scripts/memlog.exe
+2026-10-01	repo	add	Added .gitignore to ignore .kain/ intermediates, *.exe binaries, and .cache	.gitignore

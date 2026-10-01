@@ -1,0 +1,30 @@
+# Build outputs and compiler intermediates
+.kain/
+_tmp/
+out/
+*.exe
+*.pdb
+*.ll
+*.obj
+*.o
+*.a
+*.lib
+
+# Cache and IDE
+.cache/
+/.pi
+
+# Model tensors and binary data
+*.kain_bin
+*.kain_weights
+*.kain_cartridge
+*.bin
+
+# Python runtime
+__pycache__/
+*.pyc
+
+# Local databases
+*.db
+*.db-wal
+*.db-shm
