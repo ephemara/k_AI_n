@@ -15,3 +15,4 @@ date	area	type	description	file
 2026-10-01	docs	update	Moved stdlib.kn to docs/kain/stdlib.kn and established Lean Stdlib Whitelist (9 modules) in AGENTS.md	docs/kain/stdlib.kn,AGENTS.md
 2026-10-01	docs	update	Added std::gpu and std::cuda to Tier-1 Lean Stdlib Whitelist in AGENTS.md and research_4	AGENTS.md,research/research_4_kain_semantics.md
 2026-10-01	repo	refactor	Adopted Flat Core Doctrine: consolidated all core modules into flat kain/core/ directory for clean deterministic amalgamation	kain/core/,AGENTS.md,catalog.tsv
+2026-10-01	tokenizer	build	Built and proven kain/core/tokenizer_16k.kn — 16k English+Code BPE tokenizer with zero-heap arena writing and 5/5 self-test receipts	kain/core/tokenizer_16k.kn,catalog.tsv

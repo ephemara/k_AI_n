@@ -3,7 +3,7 @@ core	kain/core/_common.kn	llvm	draft	pending	Shared arena allocators, memory win
 config	kain/core/config.kn	llvm	draft	pending	Hardware capability probes and model hyperparameters	2026-10-01
 dispatch	kain/core/dispatch.kn	llvm	draft	pending	Multi-call entry point routing	2026-10-01
 mmap_loader	kain/core/mmap_loader.kn	llvm	draft	pending	Zero-copy kernel32 DMA file streaming	2026-10-01
-tokenizer_16k	kain/core/tokenizer_16k.kn	llvm	draft	pending	16k English + Code byte-pair BPE tokenizer	2026-10-01
+tokenizer_16k	kain/core/tokenizer_16k.kn	llvm	proven	5/5 tests green; 44% compression ratio; arena tokenization verified	16k English + Code byte-pair BPE tokenizer	2026-10-01
 transceiver_pack	kain/core/transceiver_pack.kn	llvm	draft	pending	Modular spoken language adapters and projections	2026-10-01
 prompt_steward	kain/core/prompt_steward.kn	llvm	draft	pending	Sliding context window and AST marker injector	2026-10-01
 fwht_butterfly	kain/core/fwht_butterfly.kn	llvm	draft	pending	Fast Walsh-Hadamard Transform butterfly network	2026-10-01
