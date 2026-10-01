@@ -1,14 +1,14 @@
 module	source	target	status	receipt	notes	updated
-core	kain/core/_common.kn	llvm	draft	pending	Shared arena allocators, memory windows, assertions	2026-10-01
+core	kain/core/_common.kn	llvm	proven	6/6 tests green; arena allocators, SIMD padding, law contracts, and kernel32 DMA roundtrip verified	Shared arena allocators, memory windows, assertions	2026-10-01
 config	kain/core/config.kn	llvm	draft	pending	Hardware capability probes and model hyperparameters	2026-10-01
-dispatch	kain/core/dispatch.kn	llvm	draft	pending	Multi-call entry point routing	2026-10-01
+dispatch	kain/core/dispatch.kn	llvm	proven	11/11 tests green; multi-call CLI routing and global prove runner verified	Multi-call entry point routing	2026-10-01
 mmap_loader	kain/core/mmap_loader.kn	llvm	draft	pending	Zero-copy kernel32 DMA file streaming	2026-10-01
 tokenizer_16k	kain/core/tokenizer_16k.kn	llvm	proven	5/5 tests green; 44% compression ratio; arena tokenization verified	16k English + Code byte-pair BPE tokenizer	2026-10-01
 transceiver_pack	kain/core/transceiver_pack.kn	llvm	draft	pending	Modular spoken language adapters and projections	2026-10-01
 prompt_steward	kain/core/prompt_steward.kn	llvm	draft	pending	Sliding context window and AST marker injector	2026-10-01
 fwht_butterfly	kain/core/fwht_butterfly.kn	llvm	draft	pending	Fast Walsh-Hadamard Transform butterfly network	2026-10-01
 hadamard_sdm	kain/core/hadamard_sdm.kn	llvm	draft	pending	0.65-bit fractional weight entanglement decoder	2026-10-01
-gemm_158b	kain/core/gemm_158b.kn	llvm	draft	pending	1.58-bit ternary dot-product kernels	2026-10-01
+gemm_158b	kain/core/gemm_158b.kn	llvm	proven	5/5 tests green; zero-matmul ternary dot, 2-bit packed, BITCOS presence zero-skipping, and matvec verified	1.58-bit ternary dot-product kernels	2026-10-01
 activations	kain/core/activations.kn	llvm	draft	pending	Fused RMSNorm, SwiGLU, RoPE, nucleus sampler	2026-10-01
 ssm_liquid	kain/core/ssm_liquid.kn	llvm	draft	pending	O(1) continuous state-space recurrence	2026-10-01
 swa_attention	kain/core/swa_attention.kn	llvm	draft	pending	Local sliding-window attention kernel	2026-10-01

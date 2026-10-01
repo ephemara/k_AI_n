@@ -584,46 +584,17 @@ pub fn tokenizer_test_battery() -> Int with Unsafe:
 
 // ── Standalone CLI Entry Point ──────────────────────────────────────────────
 
-fn print_usage():
+pub fn tokenizer_usage():
     println("k_AI_n 16k Alien Tokenizer CLI")
     println("USAGE:")
-    println("  tokenizer_16k prove                 Run self-verifying test battery")
-    println("  tokenizer_16k stats                 Print vocabulary metrics & VRAM savings")
-    println("  tokenizer_16k encode \"<text>\"       Tokenize text and print IDs")
-    println("  tokenizer_16k decode <id1> <id2>... Detokenize integer IDs to text")
+    println("  core tokenizer prove                 Run self-verifying test battery")
+    println("  core tokenizer stats                 Print vocabulary metrics & VRAM savings")
+    println("  core tokenizer encode \"<text>\"       Tokenize text and print IDs")
+    println("  core tokenizer decode <id1> <id2>... Detokenize integer IDs to text")
 
-// Simple string to integer parser
-fn parse_int_text(text: String) -> Int:
-    if len(text) == 0:
-        return 0
-    var sign = 1
-    var index = 0
-    if char_at(text, 0) == "-":
-        sign = -1
-        index = 1
-    elif char_at(text, 0) == "+":
-        index = 1
-    var value = 0
-    while index < len(text):
-        let ch = char_at(text, index)
-        if ch == "0": value = value * 10 + 0
-        elif ch == "1": value = value * 10 + 1
-        elif ch == "2": value = value * 10 + 2
-        elif ch == "3": value = value * 10 + 3
-        elif ch == "4": value = value * 10 + 4
-        elif ch == "5": value = value * 10 + 5
-        elif ch == "6": value = value * 10 + 6
-        elif ch == "7": value = value * 10 + 7
-        elif ch == "8": value = value * 10 + 8
-        elif ch == "9": value = value * 10 + 9
-        else: return value * sign
-        index = index + 1
-    return value * sign
-
-fn main() -> Int with Unsafe:
-    let args: Array<String> = process_user_args()
+pub fn tokenizer_main(args: Array<String>) -> Int with Unsafe:
     if len(args) == 0:
-        print_usage()
+        tokenizer_usage()
         return 0
 
     let cmd = args[0]
@@ -662,5 +633,5 @@ fn main() -> Int with Unsafe:
         println("Decoded text: " + text)
         return 0
     else:
-        print_usage()
+        tokenizer_usage()
         return 0

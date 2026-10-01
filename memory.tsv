@@ -16,3 +16,6 @@ date	area	type	description	file
 2026-10-01	docs	update	Added std::gpu and std::cuda to Tier-1 Lean Stdlib Whitelist in AGENTS.md and research_4	AGENTS.md,research/research_4_kain_semantics.md
 2026-10-01	repo	refactor	Adopted Flat Core Doctrine: consolidated all core modules into flat kain/core/ directory for clean deterministic amalgamation	kain/core/,AGENTS.md,catalog.tsv
 2026-10-01	tokenizer	build	Built and proven kain/core/tokenizer_16k.kn — 16k English+Code BPE tokenizer with zero-heap arena writing and 5/5 self-test receipts	kain/core/tokenizer_16k.kn,catalog.tsv
+2026-10-01	core	build	Built and proven kain/core/_common.kn — foundation memory allocators (+32 SIMD padding), tensor descriptors, kernel32 DMA, and invariant laws with 6/6 test receipts	kain/core/_common.kn,catalog.tsv
+2026-10-01	core	amalgamate	FUSED and COMPILED kain/core.kn -> kain/core.exe with _common.kn, dispatch.kn, and tokenizer_16k.kn (11/11 tests green)	kain/core.kn,kain/core.exe,kain/core/dispatch.kn,catalog.tsv
+2026-10-01	tensor	build	Built and proven kain/core/gemm_158b.kn — 1.58-bit ternary zero-matmul GEMM with September 2026 Intel BITCOS zero-skipping (16/16 global prove checks green)	kain/core/gemm_158b.kn,kain/core.kn,kain/core.exe,catalog.tsv
