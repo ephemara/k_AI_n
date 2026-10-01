@@ -1,0 +1,368 @@
+// ============================================================================
+//  k_AI_n :: activations.kn — Fused RMSNorm, SwiGLU, RoPE & Sampler Suite
+// ============================================================================
+//  Subsystem 3: Tensor Math & Zero-MatMul Kernel Suite (companion to gemm_158b)
+//  Architecture:
+//    - RMSNorm (unweighted + gamma-weighted) IN-PLACE on arena vectors.
+//    - SwiGLU gating: out = silu(gate) * value (fused, branchless, zero-copy).
+//    - RoPE rotary position embedding: pairwise rotation, norm-preserving.
+//    - Softmax (max-subtracted, numerically stable) + temperature + greedy argmax.
+//    - All transforms are IN-PLACE on ptr<Float> arenas from _common.kn.
+//      Zero heap allocations, zero serialization — pure glue relay:
+//        gemm_158b_matvec(y_arena, ...) -> rms_norm_inplace(y_arena, ...)
+//          -> swiglu_inplace(y_arena, gate_arena, ...) -> ssm step ...
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common.kn symbols (arenas, bref/fref, DMA, Tensor*).
+//    - NEVER redefines gemm_158b.kn symbols (TERNARY_*, gemm_*, ternary_*).
+//    - All new symbols use ACT_ prefix or act_ / rms_ / rope_ / softmax_ scope.
+// ============================================================================
+
+use std::math
+use std::runtime
+
+// ── Activation Constants (ACT_ scoped, no collisions) ───────────────────────
+
+pub const ACT_EULER: Float = 2.718281828459045
+pub const ACT_ROPE_THETA: Float = 10000.0
+pub const ACT_RMS_EPS_DEFAULT: Float = 0.000001
+pub const ACT_SOFTMAX_CEIL: Float = 88.0
+
+// ── Invariant Laws (uniquely named, no collisions with _common/gemm laws) ──
+
+pub law act_dims_valid(dim: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0
+
+pub law act_eps_valid(eps: Float) -> Bool:
+    return eps > 0.0 and eps < 1.0
+
+pub law act_temp_valid(temp: Float) -> Bool:
+    return temp > 0.0 and temp < 100.0
+
+// ── Scalar Nonlinearities ───────────────────────────────────────────────────
+
+// Sigmoid via pow(E, -x): 1 / (1 + e^-x), clamped to avoid overflow.
+pub fn act_sigmoid_scalar(v: Float) -> Float with Pure:
+    var nv = v
+    if nv > ACT_SOFTMAX_CEIL:
+        nv = ACT_SOFTMAX_CEIL
+    if nv < (0.0 - ACT_SOFTMAX_CEIL):
+        nv = 0.0 - ACT_SOFTMAX_CEIL
+    let e_neg = pow(ACT_EULER, 0.0 - nv)
+    return 1.0 / (1.0 + e_neg)
+
+pub fn act_silu_scalar(v: Float) -> Float with Pure:
+    return v * act_sigmoid_scalar(v)
+
+pub fn act_relu_scalar(v: Float) -> Float with Pure:
+    if v > 0.0:
+        return v
+    return 0.0
+
+// Exponential helper with ceiling (prevents inf blowup in softmax).
+pub fn act_exp_clamped(v: Float) -> Float with Pure:
+    var cv = v
+    if cv > ACT_SOFTMAX_CEIL:
+        cv = ACT_SOFTMAX_CEIL
+    if cv < (0.0 - ACT_SOFTMAX_CEIL):
+        cv = 0.0 - ACT_SOFTMAX_CEIL
+    return pow(ACT_EULER, cv)
+
+// ── Converge Block: SwiGLU Gate (spec vs fast lane) ────────────────────────
+
+pub converge act_swiglu_gate(g: Float, v: Float) -> Float:
+    spec reference:
+        return act_silu_scalar(g) * v
+    fast fast_lane when capability("cpu.x86.avx2"):
+        return act_silu_scalar(g) * v
+    verify random(8)
+
+// ── RMSNorm (IN-PLACE, zero-copy glue relay) ────────────────────────────────
+
+// Unweighted RMSNorm: x[i] = x[i] / sqrt(mean(x^2) + eps).
+pub fn rms_norm_inplace(x: ptr<Float>, dim: Int, eps: Float) -> Int with Unsafe:
+    var sum_sq: Float = 0.0
+    var i = 0
+    while i < dim:
+        let xi = mem_load(ptr_offset(x, i, "Float"), "Float") as Float
+        sum_sq = sum_sq + xi * xi
+        i = i + 1
+    let mean_sq = sum_sq / (dim as Float)
+    let inv = 1.0 / sqrt(mean_sq + eps)
+    var j = 0
+    while j < dim:
+        let xj = mem_load(ptr_offset(x, j, "Float"), "Float") as Float
+        mem_store(ptr_offset(x, j, "Float"), xj * inv, "Float")
+        j = j + 1
+    return 0
+
+// Gamma-weighted RMSNorm: x[i] = (x[i] / rms) * gamma[i].
+pub fn rms_norm_weighted_inplace(x: ptr<Float>, gamma: ptr<Float>, dim: Int, eps: Float) -> Int with Unsafe:
+    var sum_sq: Float = 0.0
+    var i = 0
+    while i < dim:
+        let xi = mem_load(ptr_offset(x, i, "Float"), "Float") as Float
+        sum_sq = sum_sq + xi * xi
+        i = i + 1
+    let mean_sq = sum_sq / (dim as Float)
+    let inv = 1.0 / sqrt(mean_sq + eps)
+    var j = 0
+    while j < dim:
+        let xj = mem_load(ptr_offset(x, j, "Float"), "Float") as Float
+        let gj = mem_load(ptr_offset(gamma, j, "Float"), "Float") as Float
+        mem_store(ptr_offset(x, j, "Float"), xj * inv * gj, "Float")
+        j = j + 1
+    return 0
+
+// ── SwiGLU (fused gating, IN-PLACE capable) ─────────────────────────────────
+
+// Out-of-place pair: out_buf[i] = silu(a[i]) * b[i].
+pub fn swiglu_pair(out_buf: ptr<Float>, a: ptr<Float>, b: ptr<Float>, dim: Int) -> Int with Unsafe:
+    var i = 0
+    while i < dim:
+        let av = mem_load(ptr_offset(a, i, "Float"), "Float") as Float
+        let bv = mem_load(ptr_offset(b, i, "Float"), "Float") as Float
+        mem_store(ptr_offset(out_buf, i, "Float"), act_swiglu_gate(av, bv), "Float")
+        i = i + 1
+    return 0
+
+// In-place fused: x[i] = silu(gate[i]) * x[i]. Zero extra memory.
+pub fn swiglu_inplace(x: ptr<Float>, gate: ptr<Float>, dim: Int) -> Int with Unsafe:
+    var i = 0
+    while i < dim:
+        let xv = mem_load(ptr_offset(x, i, "Float"), "Float") as Float
+        let gv = mem_load(ptr_offset(gate, i, "Float"), "Float") as Float
+        mem_store(ptr_offset(x, i, "Float"), act_swiglu_gate(gv, xv), "Float")
+        i = i + 1
+    return 0
+
+// ── RoPE Rotary Position Embedding (IN-PLACE, norm-preserving) ──────────────
+
+// Pairwise rotation: for each pair (2i, 2i+1), angle = pos * theta^(-2i/dim).
+pub fn rope_apply_inplace(x: ptr<Float>, dim: Int, pos: Int, theta_base: Float) -> Int with Unsafe:
+    let half_n = dim / 2
+    var p = 0
+    while p < half_n:
+        let freq = pow(theta_base, (0.0 - 2.0 * (p as Float)) / (dim as Float))
+        let angle = (pos as Float) * freq
+        let c = cos(angle)
+        let s = sin(angle)
+        let i0 = p * 2
+        let i1 = p * 2 + 1
+        let x0 = mem_load(ptr_offset(x, i0, "Float"), "Float") as Float
+        let x1 = mem_load(ptr_offset(x, i1, "Float"), "Float") as Float
+        mem_store(ptr_offset(x, i0, "Float"), x0 * c - x1 * s, "Float")
+        mem_store(ptr_offset(x, i1, "Float"), x0 * s + x1 * c, "Float")
+        p = p + 1
+    return 0
+
+// ── Softmax, Temperature & Greedy Sampler ────────────────────────────────────
+
+// Numerically stable softmax: max-subtract, exp, normalize. IN-PLACE.
+pub fn softmax_inplace(x: ptr<Float>, dim: Int) -> Int with Unsafe:
+    var mx = mem_load(ptr_offset(x, 0, "Float"), "Float") as Float
+    var i = 1
+    while i < dim:
+        let v = mem_load(ptr_offset(x, i, "Float"), "Float") as Float
+        if v > mx:
+            mx = v
+        i = i + 1
+    var sum: Float = 0.0
+    var j = 0
+    while j < dim:
+        let vj = mem_load(ptr_offset(x, j, "Float"), "Float") as Float
+        let e = act_exp_clamped(vj - mx)
+        mem_store(ptr_offset(x, j, "Float"), e, "Float")
+        sum = sum + e
+        j = j + 1
+    let inv_sum = 1.0 / sum
+    var k = 0
+    while k < dim:
+        let ek = mem_load(ptr_offset(x, k, "Float"), "Float") as Float
+        mem_store(ptr_offset(x, k, "Float"), ek * inv_sum, "Float")
+        k = k + 1
+    return 0
+
+// Temperature scaling: x[i] = x[i] / temp. IN-PLACE.
+pub fn temperature_scale_inplace(x: ptr<Float>, dim: Int, temp: Float) -> Int with Unsafe:
+    let inv = 1.0 / temp
+    var i = 0
+    while i < dim:
+        let v = mem_load(ptr_offset(x, i, "Float"), "Float") as Float
+        mem_store(ptr_offset(x, i, "Float"), v * inv, "Float")
+        i = i + 1
+    return 0
+
+// Greedy argmax: index of maximum logit.
+pub fn greedy_argmax(x: ptr<Float>, dim: Int) -> Int with Unsafe:
+    var best = 0
+    var best_v = mem_load(ptr_offset(x, 0, "Float"), "Float") as Float
+    var i = 1
+    while i < dim:
+        let v = mem_load(ptr_offset(x, i, "Float"), "Float") as Float
+        if v > best_v:
+            best_v = v
+            best = i
+        i = i + 1
+    return best
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn activations_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n activations Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: RMSNorm on uniform vector [2,2,2,2,2,2,2,2] -> rms=2 -> all ones.
+    total = total + 1
+    let n1 = 8
+    let x1: ptr<Float> = alloc_zeroed(64, "Float")
+    var f1 = 0
+    while f1 < n1:
+        mem_store(ptr_offset(x1, f1, "Float"), 2.0 as Float, "Float")
+        f1 = f1 + 1
+    rms_norm_inplace(x1, n1, 0.000001)
+    let r0 = mem_load(ptr_offset(x1, 0, "Float"), "Float") as Float
+    let r7 = mem_load(ptr_offset(x1, 7, "Float"), "Float") as Float
+    decay x1
+    if r0 > 0.99 and r0 < 1.01 and r7 > 0.99 and r7 < 1.01:
+        println("  [PASS] Test 1: RMSNorm uniform vector normalized to ones")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: RMSNorm mismatch (got " + str(r0) + ", " + str(r7) + ")")
+
+    // Test 2: SwiGLU zero-gate kills + converge gate matches silu math.
+    // gate=[0 x8] => silu(0)=0 => out all zeros regardless of value.
+    total = total + 1
+    let n2 = 8
+    let a2: ptr<Float> = alloc_zeroed(64, "Float")
+    let b2: ptr<Float> = alloc_zeroed(64, "Float")
+    let o2: ptr<Float> = alloc_zeroed(64, "Float")
+    var f2 = 0
+    while f2 < n2:
+        mem_store(ptr_offset(a2, f2, "Float"), 0.0 as Float, "Float")
+        mem_store(ptr_offset(b2, f2, "Float"), 5.0 as Float, "Float")
+        f2 = f2 + 1
+    swiglu_pair(o2, a2, b2, n2)
+    let s0 = mem_load(ptr_offset(o2, 0, "Float"), "Float") as Float
+    let gate_ref = act_swiglu_gate(1.0, 2.0)
+    let silu_ref = act_silu_scalar(1.0) * 2.0
+    let gate_ok = gate_ref > silu_ref - 0.0001 and gate_ref < silu_ref + 0.0001
+    decay a2
+    decay b2
+    decay o2
+    if s0 > -0.0001 and s0 < 0.0001 and gate_ok:
+        println("  [PASS] Test 2: SwiGLU zero-gate kills output, converge gate matches silu")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: SwiGLU mismatch")
+
+    // Test 3: RoPE identity at pos=0 + norm preservation at pos=7.
+    total = total + 1
+    let n3 = 8
+    let x3: ptr<Float> = alloc_zeroed(64, "Float")
+    var f3 = 0
+    while f3 < n3:
+        mem_store(ptr_offset(x3, f3, "Float"), (f3 as Float) + 1.0, "Float")
+        f3 = f3 + 1
+    rope_apply_inplace(x3, n3, 0, ACT_ROPE_THETA)
+    let id0 = mem_load(ptr_offset(x3, 0, "Float"), "Float") as Float
+    let id7 = mem_load(ptr_offset(x3, 7, "Float"), "Float") as Float
+    var pre_sq: Float = 0.0
+    var f3b = 0
+    while f3b < n3:
+        let vv = mem_load(ptr_offset(x3, f3b, "Float"), "Float") as Float
+        pre_sq = pre_sq + vv * vv
+        f3b = f3b + 1
+    rope_apply_inplace(x3, n3, 7, ACT_ROPE_THETA)
+    var post_sq: Float = 0.0
+    var f3c = 0
+    while f3c < n3:
+        let ww = mem_load(ptr_offset(x3, f3c, "Float"), "Float") as Float
+        post_sq = post_sq + ww * ww
+        f3c = f3c + 1
+    decay x3
+    let id_ok = id0 > 0.999 and id0 < 1.001 and id7 > 7.999 and id7 < 8.001
+    var drift = post_sq - pre_sq
+    if drift < 0.0:
+        drift = 0.0 - drift
+    if id_ok and drift < 0.001:
+        println("  [PASS] Test 3: RoPE pos=0 identity, pos=7 norm-preserving rotation")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: RoPE mismatch")
+
+    // Test 4: Softmax uniform [1x8] -> each 0.125, sum 1.0 + greedy argmax.
+    total = total + 1
+    let n4 = 8
+    let x4: ptr<Float> = alloc_zeroed(64, "Float")
+    var f4 = 0
+    while f4 < n4:
+        mem_store(ptr_offset(x4, f4, "Float"), 1.0 as Float, "Float")
+        f4 = f4 + 1
+    softmax_inplace(x4, n4)
+    let p0 = mem_load(ptr_offset(x4, 0, "Float"), "Float") as Float
+    var psum: Float = 0.0
+    var f4b = 0
+    while f4b < n4:
+        psum = psum + (mem_load(ptr_offset(x4, f4b, "Float"), "Float") as Float)
+        f4b = f4b + 1
+    mem_store(ptr_offset(x4, 2, "Float"), 0.9 as Float, "Float")
+    let amax = greedy_argmax(x4, n4)
+    decay x4
+    if p0 > 0.124 and p0 < 0.126 and psum > 0.999 and psum < 1.001 and amax == 2:
+        println("  [PASS] Test 4: Softmax uniform 0.125 each, sum 1.0, argmax correct")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: Softmax/argmax mismatch")
+
+    // Test 5: Invariant laws.
+    total = total + 1
+    let l1 = act_dims_valid(64)
+    let l2 = act_dims_valid(63)
+    let l3 = act_eps_valid(0.000001)
+    let l4 = act_eps_valid(0.0)
+    let l5 = act_temp_valid(0.7)
+    let l6 = act_temp_valid(0.0)
+    if l1 and (l2 == false) and l3 and (l4 == false) and l5 and (l6 == false):
+        println("  [PASS] Test 5: Activation dimension, eps & temperature laws passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Invariant laws failed")
+
+    println("--- activations Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn activations_usage():
+    println("k_AI_n Fused Activation Suite (activations.kn)")
+    println("USAGE:")
+    println("  core activations prove               Run self-verifying test battery")
+    println("  core activations stats               Print RMSNorm/SwiGLU/RoPE metrics")
+
+pub fn activations_stats() -> String:
+    var t = "=== k_AI_n Fused Activation Suite ===\n"
+    t = t + "  RMSNorm:        In-place, eps=1e-6, optional gamma weighting\n"
+    t = t + "  SwiGLU:         Fused silu(gate)*value, converge-verified AVX2 lane\n"
+    t = t + "  RoPE:           Pairwise rotation, theta=10000, norm-preserving\n"
+    t = t + "  Softmax:        Max-subtracted stable, in-place, sum=1.0\n"
+    t = t + "  Sampler:        Temperature scale + greedy argmax\n"
+    t = t + "  Allocations:    0 (in-place arena relay, zero-copy glue)\n"
+    return t
+
+pub fn activations_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        activations_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return activations_test_battery()
+    elif cmd == "stats":
+        println(activations_stats())
+        return 0
+    else:
+        activations_usage()
+        return 0

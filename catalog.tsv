@@ -9,8 +9,8 @@ prompt_steward	kain/core/prompt_steward.kn	llvm	draft	pending	Sliding context wi
 fwht_butterfly	kain/core/fwht_butterfly.kn	llvm	draft	pending	Fast Walsh-Hadamard Transform butterfly network	2026-10-01
 hadamard_sdm	kain/core/hadamard_sdm.kn	llvm	draft	pending	0.65-bit fractional weight entanglement decoder	2026-10-01
 gemm_158b	kain/core/gemm_158b.kn	llvm	proven	5/5 tests green; zero-matmul ternary dot, 2-bit packed, BITCOS presence zero-skipping, and matvec verified	1.58-bit ternary dot-product kernels	2026-10-01
-activations	kain/core/activations.kn	llvm	draft	pending	Fused RMSNorm, SwiGLU, RoPE, nucleus sampler	2026-10-01
-ssm_liquid	kain/core/ssm_liquid.kn	llvm	draft	pending	O(1) continuous state-space recurrence	2026-10-01
+activations	kain/core/activations.kn	llvm	proven	5/5 tests green; RMSNorm ones, SwiGLU zero-gate, RoPE norm-preserving, softmax 0.125+argmax verified	Fused RMSNorm, SwiGLU, RoPE, nucleus sampler	2026-10-01
+ssm_liquid	kain/core/ssm_liquid.kn	llvm	proven	5/5 tests green; reset+step fill, geometric decay, readout sum, fused forward+skip verified	O(1) continuous state-space recurrence	2026-10-01
 swa_attention	kain/core/swa_attention.kn	llvm	draft	pending	Local sliding-window attention kernel	2026-10-01
 deq_equilibrium	kain/core/deq_equilibrium.kn	llvm	draft	pending	Monotone Operator fixed-point solver	2026-10-01
 moe_micro_basis	kain/core/moe_micro_basis.kn	llvm	draft	pending	Combinatorial micro-expert router	2026-10-01

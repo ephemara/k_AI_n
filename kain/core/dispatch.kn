@@ -22,7 +22,9 @@ pub fn core_usage():
     println("")
     println("COMMANDS:")
     println("  prove                      Run formal self-test batteries across all modules")
+    println("  ssm <subcommand>           O(1) Liquid Memory SSM (prove, stats)")
     println("  gemm <subcommand>          1.58-Bit Ternary GEMM Engine (prove, stats)")
+    println("  activations <subcommand>   Fused RMSNorm/SwiGLU/RoPE Suite (prove, stats)")
     println("  tokenizer <subcommand>     16k Alien Tokenizer (encode, decode, stats, prove)")
     println("  common prove               Run _common.kn memory & DMA self-tests")
     println("  help [command]             Show detailed help for a subsystem")
@@ -42,28 +44,58 @@ fn main() -> Int with Unsafe:
     // Global Test Suite
     if cmd == "prove" or cmd == "test":
         core_banner()
-        println("[1/3] Testing Core Substrate & Memory Arenas (_common.kn)...")
+        println("[1/5] Testing Core Substrate & Memory Arenas (_common.kn)...")
         let common_rc = common_test_battery()
         if common_rc != 0:
             println("error: _common.kn test battery failed with exit code " + str(common_rc))
             return common_rc
 
-        println("[2/3] Testing 16k Alien Tokenizer (tokenizer_16k.kn)...")
+        println("[2/5] Testing 16k Alien Tokenizer (tokenizer_16k.kn)...")
         let tok_rc = tokenizer_test_battery()
         if tok_rc != 0:
             println("error: tokenizer_16k.kn test battery failed with exit code " + str(tok_rc))
             return tok_rc
 
-        println("[3/3] Testing 1.58-Bit Ternary GEMM Engine (gemm_158b.kn)...")
+        println("[3/5] Testing 1.58-Bit Ternary GEMM Engine (gemm_158b.kn)...")
         let gemm_rc = gemm_test_battery()
         if gemm_rc != 0:
             println("error: gemm_158b.kn test battery failed with exit code " + str(gemm_rc))
             return gemm_rc
 
+        println("[4/5] Testing Fused Activation Suite (activations.kn)...")
+        let act_rc = activations_test_battery()
+        if act_rc != 0:
+            println("error: activations.kn test battery failed with exit code " + str(act_rc))
+            return act_rc
+
+        println("[5/5] Testing O(1) Liquid Memory (ssm_liquid.kn)...")
+        let ssm_rc = ssm_test_battery()
+        if ssm_rc != 0:
+            println("error: ssm_liquid.kn test battery failed with exit code " + str(ssm_rc))
+            return ssm_rc
+
         println("======================================================================")
-        println("  ALL SELF-TEST BATTERIES PASSED (16/16 checks green)")
+        println("  ALL SELF-TEST BATTERIES PASSED (26/26 checks green)")
         println("======================================================================")
         return 0
+
+    // SSM Liquid Memory Subsystem
+    elif cmd == "ssm" or cmd == "ssm_liquid":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return ssm_main(sub_args)
+
+    // Activations Subsystem
+    elif cmd == "activations" or cmd == "act":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return activations_main(sub_args)
 
     // GEMM Subsystem
     elif cmd == "gemm":

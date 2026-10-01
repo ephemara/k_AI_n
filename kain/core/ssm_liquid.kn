@@ -1,0 +1,325 @@
+// ============================================================================
+//  k_AI_n :: ssm_liquid.kn — O(1) Continuous Liquid Memory (SSM Recurrence)
+// ============================================================================
+//  Subsystem 4: Recurrent Hybrid & Equilibrium Engine
+//  Architecture:
+//    - Linear State-Space Model recurrence with zero-order-hold discretization:
+//        decay_s  = exp(-dt * A[s])          (per-state forget factor)
+//        st[s,d]  = decay_s * st[s,d] + (dt * B[s]) * x[d]
+//        y[d]     = sum_s C[s] * st[s,d] + skip * x[d]
+//    - Fixed-size persistent state matrix (dim_s x dim_d, e.g. 128 x 4096):
+//      infinite context in O(1) memory — history compresses, VRAM never grows.
+//    - THE glue relay after activations:
+//        gemm_158b_matvec(y_arena, ...) -> rms_norm_inplace(y_arena, ...)
+//          -> swiglu_inplace(y_arena, gate, ...) -> ssm_forward_step(out, st, y_arena, ...)
+//      State persists across tokens; activations stream through it in-place.
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common.kn symbols (arenas, bref/fref, DMA, Tensor*).
+//    - NEVER redefines gemm_158b.kn symbols (TERNARY_*, gemm_*, ternary_*).
+//    - NEVER redefines activations.kn symbols (ACT_*, act_*, rms_*, rope_*, softmax_*).
+//    - All new symbols use SSM_ prefix or ssm_ scope.
+// ============================================================================
+
+use std::math
+use std::runtime
+
+// ── SSM Constants (SSM_ scoped, no collisions) ──────────────────────────────
+
+pub const SSM_EULER: Float = 2.718281828459045
+pub const SSM_DT_DEFAULT: Float = 0.1
+pub const SSM_DT_CEIL: Float = 10.0
+pub const SSM_STATE_DIM_DEFAULT: Int = 128
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law ssm_dims_valid(ds: Int, dd: Int) -> Bool:
+    return ds > 0 and dd > 0 and (dd % 8) == 0
+
+pub law ssm_dt_valid(dt: Float) -> Bool:
+    return dt >= 0.0 and dt <= SSM_DT_CEIL
+
+pub law ssm_decay_valid(a: Float) -> Bool:
+    return a >= 0.0 and a <= 100.0
+
+// ── Scalar Helpers ──────────────────────────────────────────────────────────
+
+// Clamped exponential (prevents inf blowup on large negative/positive args).
+pub fn ssm_exp_clamped(v: Float) -> Float with Pure:
+    var cv = v
+    if cv > SSM_DT_CEIL:
+        cv = SSM_DT_CEIL
+    if cv < (0.0 - SSM_DT_CEIL):
+        cv = 0.0 - SSM_DT_CEIL
+    return pow(SSM_EULER, cv)
+
+// Discrete forget factor for one state channel: decay = exp(-dt * A).
+pub fn ssm_discrete_decay(a_val: Float, dt: Float) -> Float with Pure:
+    return ssm_exp_clamped(0.0 - dt * a_val)
+
+// Local sigmoid (SSM-scoped copy, no cross-module dependency for standalone check).
+pub fn ssm_sigmoid_scalar(v: Float) -> Float with Pure:
+    var nv = v
+    if nv > SSM_DT_CEIL:
+        nv = SSM_DT_CEIL
+    if nv < (0.0 - SSM_DT_CEIL):
+        nv = 0.0 - SSM_DT_CEIL
+    let e_neg = pow(SSM_EULER, 0.0 - nv)
+    return 1.0 / (1.0 + e_neg)
+
+// Selective timestep: dt_eff = dt_base * sigmoid(gate). Input-dependent gating.
+pub fn ssm_select_dt(dt_base: Float, gate: Float) -> Float with Pure:
+    return dt_base * ssm_sigmoid_scalar(gate)
+
+// ── Converge Block: Per-Cell State Update (spec vs fast lane) ───────────────
+
+pub converge ssm_state_update(h: Float, forget_f: Float, drive: Float) -> Float:
+    spec reference:
+        return h * forget_f + drive
+    fast fast_lane when capability("cpu.x86.avx2"):
+        return h * forget_f + drive
+    verify random(8)
+
+// ── Core Kernels (all IN-PLACE on persistent state arena) ───────────────────
+
+// Zero the full state matrix (dim_s x dim_d).
+pub fn ssm_reset(st: ptr<Float>, dim_s: Int, dim_d: Int) -> Int with Unsafe:
+    var s = 0
+    while s < dim_s:
+        var d = 0
+        while d < dim_d:
+            mem_store(ptr_offset(st, s * dim_d + d, "Float"), 0.0 as Float, "Float")
+            d = d + 1
+        s = s + 1
+    return 0
+
+// Single recurrent step: st[s,d] = decay_s * st[s,d] + (dt * B[s]) * x[d].
+pub fn ssm_step_inplace(st: ptr<Float>, x_in: ptr<Float>, a_diag: ptr<Float>, b_vec: ptr<Float>, dim_s: Int, dim_d: Int, dt: Float) -> Int with Unsafe:
+    var s = 0
+    while s < dim_s:
+        let a_s = mem_load(ptr_offset(a_diag, s, "Float"), "Float") as Float
+        let b_s = mem_load(ptr_offset(b_vec, s, "Float"), "Float") as Float
+        let forget_f = ssm_discrete_decay(a_s, dt)
+        let drive_scale = dt * b_s
+        var d = 0
+        while d < dim_d:
+            let h = mem_load(ptr_offset(st, s * dim_d + d, "Float"), "Float") as Float
+            let xv = mem_load(ptr_offset(x_in, d, "Float"), "Float") as Float
+            mem_store(ptr_offset(st, s * dim_d + d, "Float"), ssm_state_update(h, forget_f, drive_scale * xv), "Float")
+            d = d + 1
+        s = s + 1
+    return 0
+
+// Linear readout: y_out[d] = sum_s C[s] * st[s,d].
+pub fn ssm_readout(y_out: ptr<Float>, st: ptr<Float>, c_vec: ptr<Float>, dim_s: Int, dim_d: Int) -> Int with Unsafe:
+    var d = 0
+    while d < dim_d:
+        var acc: Float = 0.0
+        var s = 0
+        while s < dim_s:
+            let c_s = mem_load(ptr_offset(c_vec, s, "Float"), "Float") as Float
+            let h = mem_load(ptr_offset(st, s * dim_d + d, "Float"), "Float") as Float
+            acc = acc + c_s * h
+            s = s + 1
+        mem_store(ptr_offset(y_out, d, "Float"), acc, "Float")
+        d = d + 1
+    return 0
+
+// Fused forward step (THE glue relay): recurrent update + readout + skip.
+//   st <- step(st, x_in);  y_out[d] = readout(st)[d] + skip * x_in[d].
+pub fn ssm_forward_step(y_out: ptr<Float>, st: ptr<Float>, x_in: ptr<Float>, a_diag: ptr<Float>, b_vec: ptr<Float>, c_vec: ptr<Float>, skip: Float, dim_s: Int, dim_d: Int, dt: Float) -> Int with Unsafe:
+    ssm_step_inplace(st, x_in, a_diag, b_vec, dim_s, dim_d, dt)
+    ssm_readout(y_out, st, c_vec, dim_s, dim_d)
+    var d = 0
+    while d < dim_d:
+        let yv = mem_load(ptr_offset(y_out, d, "Float"), "Float") as Float
+        let xv = mem_load(ptr_offset(x_in, d, "Float"), "Float") as Float
+        mem_store(ptr_offset(y_out, d, "Float"), yv + skip * xv, "Float")
+        d = d + 1
+    return 0
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn ssm_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n ssm_liquid Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Reset zeros + single step fills state with input.
+    // A=[1 x4], B=[1 x4], x=[1 x8], dt=1: decay=e^-1, drive=1*1 -> st=1.0.
+    total = total + 1
+    let ds1 = 4
+    let dd1 = 8
+    let st1: ptr<Float> = alloc_zeroed(128, "Float")
+    let x1: ptr<Float> = alloc_zeroed(64, "Float")
+    let a1: ptr<Float> = alloc_zeroed(64, "Float")
+    let b1: ptr<Float> = alloc_zeroed(64, "Float")
+    ssm_reset(st1, ds1, dd1)
+    var f1 = 0
+    while f1 < dd1:
+        mem_store(ptr_offset(x1, f1, "Float"), 1.0 as Float, "Float")
+        f1 = f1 + 1
+    var g1 = 0
+    while g1 < ds1:
+        mem_store(ptr_offset(a1, g1, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(b1, g1, "Float"), 1.0 as Float, "Float")
+        g1 = g1 + 1
+    ssm_step_inplace(st1, x1, a1, b1, ds1, dd1, 1.0)
+    let h00 = mem_load(ptr_offset(st1, 0, "Float"), "Float") as Float
+    let h37 = mem_load(ptr_offset(st1, 3 * dd1 + 7, "Float"), "Float") as Float
+    decay st1
+    decay x1
+    decay a1
+    decay b1
+    if h00 > 0.999 and h00 < 1.001 and h37 > 0.999 and h37 < 1.001:
+        println("  [PASS] Test 1: Reset + single step fills state with input (1.0)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: State step mismatch (got " + str(h00) + ", " + str(h37) + ")")
+
+    // Test 2: Zero-input decay is geometric: st=2.0, x=0, A=1, dt=1 -> 2*e^-1 ~= 0.7358.
+    total = total + 1
+    let ds2 = 4
+    let dd2 = 8
+    let st2: ptr<Float> = alloc_zeroed(128, "Float")
+    let x2: ptr<Float> = alloc_zeroed(64, "Float")
+    let a2: ptr<Float> = alloc_zeroed(64, "Float")
+    let b2: ptr<Float> = alloc_zeroed(64, "Float")
+    var f2 = 0
+    while f2 < ds2 * dd2:
+        mem_store(ptr_offset(st2, f2, "Float"), 2.0 as Float, "Float")
+        f2 = f2 + 1
+    var g2 = 0
+    while g2 < ds2:
+        mem_store(ptr_offset(a2, g2, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(b2, g2, "Float"), 1.0 as Float, "Float")
+        g2 = g2 + 1
+    ssm_step_inplace(st2, x2, a2, b2, ds2, dd2, 1.0)
+    let d0 = mem_load(ptr_offset(st2, 0, "Float"), "Float") as Float
+    decay st2
+    decay x2
+    decay a2
+    decay b2
+    if d0 > 0.735 and d0 < 0.737:
+        println("  [PASS] Test 2: Zero-input geometric decay verified (2*e^-1)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Decay mismatch (got " + str(d0) + ")")
+
+    // Test 3: Readout sums state rows: st=1.0 everywhere, C=[1 x4] -> y[d]=4.0.
+    total = total + 1
+    let ds3 = 4
+    let dd3 = 8
+    let st3: ptr<Float> = alloc_zeroed(128, "Float")
+    let y3: ptr<Float> = alloc_zeroed(64, "Float")
+    let c3: ptr<Float> = alloc_zeroed(64, "Float")
+    var f3 = 0
+    while f3 < ds3 * dd3:
+        mem_store(ptr_offset(st3, f3, "Float"), 1.0 as Float, "Float")
+        f3 = f3 + 1
+    var g3 = 0
+    while g3 < ds3:
+        mem_store(ptr_offset(c3, g3, "Float"), 1.0 as Float, "Float")
+        g3 = g3 + 1
+    ssm_readout(y3, st3, c3, ds3, dd3)
+    let y0 = mem_load(ptr_offset(y3, 0, "Float"), "Float") as Float
+    let y7 = mem_load(ptr_offset(y3, 7, "Float"), "Float") as Float
+    decay st3
+    decay y3
+    decay c3
+    if y0 > 3.999 and y0 < 4.001 and y7 > 3.999 and y7 < 4.001:
+        println("  [PASS] Test 3: Linear readout sums state rows (4.0)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: Readout mismatch (got " + str(y0) + ", " + str(y7) + ")")
+
+    // Test 4: Fused forward + skip: st=0, x=2.0, A=B=C=1, skip=0.5, dt=1
+    // st -> 2.0 each; readout -> 8.0; + skip 1.0 -> y=9.0. Selective dt sanity.
+    total = total + 1
+    let ds4 = 4
+    let dd4 = 8
+    let st4: ptr<Float> = alloc_zeroed(128, "Float")
+    let x4: ptr<Float> = alloc_zeroed(64, "Float")
+    let y4: ptr<Float> = alloc_zeroed(64, "Float")
+    let a4: ptr<Float> = alloc_zeroed(64, "Float")
+    let b4: ptr<Float> = alloc_zeroed(64, "Float")
+    let c4: ptr<Float> = alloc_zeroed(64, "Float")
+    ssm_reset(st4, ds4, dd4)
+    var f4 = 0
+    while f4 < dd4:
+        mem_store(ptr_offset(x4, f4, "Float"), 2.0 as Float, "Float")
+        f4 = f4 + 1
+    var g4 = 0
+    while g4 < ds4:
+        mem_store(ptr_offset(a4, g4, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(b4, g4, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(c4, g4, "Float"), 1.0 as Float, "Float")
+        g4 = g4 + 1
+    ssm_forward_step(y4, st4, x4, a4, b4, c4, 0.5, ds4, dd4, 1.0)
+    let fy0 = mem_load(ptr_offset(y4, 0, "Float"), "Float") as Float
+    let fy7 = mem_load(ptr_offset(y4, 7, "Float"), "Float") as Float
+    let dt_open = ssm_select_dt(0.1, 10.0)
+    let dt_shut = ssm_select_dt(0.1, -10.0)
+    decay st4
+    decay x4
+    decay y4
+    decay a4
+    decay b4
+    decay c4
+    let gate_ok = dt_open > 0.0999 and dt_open < 0.1001 and dt_shut >= 0.0 and dt_shut < 0.001
+    if fy0 > 8.999 and fy0 < 9.001 and fy7 > 8.999 and fy7 < 9.001 and gate_ok:
+        println("  [PASS] Test 4: Fused forward+skip verified (9.0), selective dt gates")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: Forward/skip mismatch")
+
+    // Test 5: Invariant laws.
+    total = total + 1
+    let l1 = ssm_dims_valid(4, 8)
+    let l2 = ssm_dims_valid(4, 7)
+    let l3 = ssm_dt_valid(0.1)
+    let l4 = ssm_dt_valid(-1.0)
+    let l5 = ssm_decay_valid(1.0)
+    let l6 = ssm_decay_valid(-1.0)
+    if l1 and (l2 == false) and l3 and (l4 == false) and l5 and (l6 == false):
+        println("  [PASS] Test 5: SSM dimension, dt & decay laws passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Invariant laws failed")
+
+    println("--- ssm_liquid Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn ssm_usage():
+    println("k_AI_n O(1) Liquid Memory (ssm_liquid.kn)")
+    println("USAGE:")
+    println("  core ssm prove                     Run self-verifying test battery")
+    println("  core ssm stats                     Print state/memory metrics")
+
+pub fn ssm_stats() -> String:
+    var t = "=== k_AI_n O(1) Liquid Memory (SSM) ===\n"
+    t = t + "  Recurrence:   st = exp(-dt*A)*st + (dt*B)*x (ZOH discretized)\n"
+    t = t + "  Readout:      y = C*st + skip*x (fused forward step)\n"
+    t = t + "  State:        Fixed dim_s x dim_d matrix (e.g. 128 x 4096 = 128MB)\n"
+    t = t + "  Context:      Infinite (O(1) memory, history compresses in place)\n"
+    t = t + "  Selective:    dt_eff = dt_base * sigmoid(gate) per step\n"
+    t = t + "  Allocations:  0 per step (in-place persistent arena)\n"
+    return t
+
+pub fn ssm_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        ssm_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return ssm_test_battery()
+    elif cmd == "stats":
+        println(ssm_stats())
+        return 0
+    else:
+        ssm_usage()
+        return 0
