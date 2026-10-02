@@ -22,6 +22,9 @@ pub fn core_usage():
     println("")
     println("COMMANDS:")
     println("  prove                      Run formal self-test batteries across all modules")
+    println("  config <subcommand>       Architecture Hyperparameters (prove, stats, show)")
+    println("  pack <subcommand>          .kain_bin Training Stream Packager (prove, stats)")
+    println("  distill <subcommand>       Invariant-Weighted Distill Loss (prove, stats)")
     println("  ssm <subcommand>           O(1) Liquid Memory SSM (prove, stats)")
     println("  gemm <subcommand>          1.58-Bit Ternary GEMM Engine (prove, stats)")
     println("  activations <subcommand>   Fused RMSNorm/SwiGLU/RoPE Suite (prove, stats)")
@@ -44,40 +47,85 @@ fn main() -> Int with Unsafe:
     // Global Test Suite
     if cmd == "prove" or cmd == "test":
         core_banner()
-        println("[1/5] Testing Core Substrate & Memory Arenas (_common.kn)...")
+        println("[1/8] Testing Core Substrate & Memory Arenas (_common.kn)...")
         let common_rc = common_test_battery()
         if common_rc != 0:
             println("error: _common.kn test battery failed with exit code " + str(common_rc))
             return common_rc
 
-        println("[2/5] Testing 16k Alien Tokenizer (tokenizer_16k.kn)...")
+        println("[2/8] Testing 16k Alien Tokenizer (tokenizer_16k.kn)...")
         let tok_rc = tokenizer_test_battery()
         if tok_rc != 0:
             println("error: tokenizer_16k.kn test battery failed with exit code " + str(tok_rc))
             return tok_rc
 
-        println("[3/5] Testing 1.58-Bit Ternary GEMM Engine (gemm_158b.kn)...")
+        println("[3/8] Testing 1.58-Bit Ternary GEMM Engine (gemm_158b.kn)...")
         let gemm_rc = gemm_test_battery()
         if gemm_rc != 0:
             println("error: gemm_158b.kn test battery failed with exit code " + str(gemm_rc))
             return gemm_rc
 
-        println("[4/5] Testing Fused Activation Suite (activations.kn)...")
+        println("[4/8] Testing Fused Activation Suite (activations.kn)...")
         let act_rc = activations_test_battery()
         if act_rc != 0:
             println("error: activations.kn test battery failed with exit code " + str(act_rc))
             return act_rc
 
-        println("[5/5] Testing O(1) Liquid Memory (ssm_liquid.kn)...")
+        println("[5/8] Testing O(1) Liquid Memory (ssm_liquid.kn)...")
         let ssm_rc = ssm_test_battery()
         if ssm_rc != 0:
             println("error: ssm_liquid.kn test battery failed with exit code " + str(ssm_rc))
             return ssm_rc
 
+        println("[6/8] Testing Invariant-Weighted Distill Loss (distill_loss.kn)...")
+        let dist_rc = distill_test_battery()
+        if dist_rc != 0:
+            println("error: distill_loss.kn test battery failed with exit code " + str(dist_rc))
+            return dist_rc
+
+        println("[7/8] Testing .kain_bin Training Stream (binary_packer.kn)...")
+        let pack_rc = binpack_test_battery()
+        if pack_rc != 0:
+            println("error: binary_packer.kn test battery failed with exit code " + str(pack_rc))
+            return pack_rc
+
+        println("[8/8] Testing Architecture Config (config.kn)...")
+        let cfg_rc = config_test_battery()
+        if cfg_rc != 0:
+            println("error: config.kn test battery failed with exit code " + str(cfg_rc))
+            return cfg_rc
+
         println("======================================================================")
-        println("  ALL SELF-TEST BATTERIES PASSED (26/26 checks green)")
+        println("  ALL SELF-TEST BATTERIES PASSED (41/41 checks green)")
         println("======================================================================")
         return 0
+
+    // Config Subsystem
+    elif cmd == "config" or cmd == "cfg":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return config_main(sub_args)
+
+    // Binary Packer Subsystem
+    elif cmd == "pack" or cmd == "binpack":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return binpack_main(sub_args)
+
+    // Distill Loss Subsystem
+    elif cmd == "distill" or cmd == "distil":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return distill_main(sub_args)
 
     // SSM Liquid Memory Subsystem
     elif cmd == "ssm" or cmd == "ssm_liquid":

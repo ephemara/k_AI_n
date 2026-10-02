@@ -537,9 +537,43 @@ Columns: `module  source  target  status  receipt  notes  updated` (tab-separate
   `out`, `share`, `match`, `policy`, `deps`, `fast`, `spec` are reserved keywords.
   Do not use them as parameter names, field names, or local variables. Use `out_val`,
   `share_mode`, `matched`, `policy_cfg`.
+  (`decay` and `half` also bite: `decay` is the arena lifecycle keyword — a converge
+  param named `decay` fails parse, use `forget_f`; `half` is reserved, use `half_n`.)
 - **String interpolation quirks:**
   `"{var}"` can print literally in certain compiler paths. Prefer string concatenation
   or explicit string formatting functions (`str(x)`).
+- **Effect-annotated functions MUST declare a return type (bled for in `binary_packer`):**
+  A `pub fn f(...) with Unsafe:` with NO `-> Type` that does real work and gets called
+  segfaults (exit 127/139) at the call site. Bare `pub fn f():` is only safe for trivial
+  print-only usages with no `with` clause. Always write `-> Int` + explicit `return 0`:
+  ```kn
+  // CRASHES at call site (exit 127):
+  pub fn bin_write_u64(buf: ptr<Byte>, off: Int, v: Int) with Unsafe:
+      mem_store(...)
+
+  // CORRECT:
+  pub fn bin_write_u64(buf: ptr<Byte>, off: Int, v: Int) -> Int with Unsafe:
+      mem_store(...)
+      return 0
+  ```
+- **Parenthesize EVERY bitwise/shift mix (bled for in `binary_packer`):**
+  Kain operator precedence around `&`, `>>`, `<<` is NOT C-like and bites two ways:
+  - `if mem_load(...) & 255 != MAGIC:` is a hard parse error (`&` binds looser than `!=`)
+    → write `if (mem_load(...) & 255) != MAGIC:`.
+  - `acc = acc + byte_v << shift` COMPILES but silently misaccumulates (read 0 instead
+    of 8192) → write `acc = acc + (byte_v << shift)`. The silent form is worse than the
+    error — when a codec reads back wrong, suspect missing parens FIRST.
+  Rule: any expression mixing arithmetic with `&`, `|`, `>>`, `<<` gets explicit parens.
+- **One concern per loop (bled for in `binary_packer`):**
+  A loop body mixing token-codec lets/stores with mask-codec lets/stores silently dropped
+  the mask writes (tokens landed, mask read 0 — same code worked in isolation and as
+  read-your-write). Splitting into a token loop + a separate mask loop went 3/5 → 5/5
+  with zero other changes. When a fused loop drops one stream, split the streams.
+- **Bisect native crashes via `kain/spike/` probes (the method that solved the above):**
+  `cp kain/core/<mod>.kn kain/spike/probe.kn`, append a `fn main()` that calls deeper
+  into the suspect path with prints, `kain build kain/spike/probe.kn -o probe.exe`, run.
+  Spike files are standalone translation units (own `main`, never amalgamated), so delete
+  them after (`rm kain/spike/probe.kn probe.exe`) to keep the repo clean.
 - **Trig probes via `kain -c`:**
   `kain -c 'sin(1.57)'` can return 0 due to repl harness stubbing. Real trig functions
   work accurately when compiled from source files. Always verify mathematical kernels
@@ -549,16 +583,29 @@ Columns: `module  source  target  status  receipt  notes  updated` (tab-separate
 
 ## 9. Current Phase & Immediate Roadmap
 
-We are executing the **Step 0 & Step 1 Pilot**:
-1. **Scaffold the 6 Subsystems in `kain/`:** Establish `kain/core/`, `kain/tokenizer/`,
-   `kain/tensor/`, `kain/model/`, `kain/flow/`, and `kain/refinery/`.
-2. **Solidify the Glue (`kain/core/_common.kn`):** Pin down the shared arena allocators,
-   memory windows, SIMD safety padding, and tensor view structs that bind all modules together.
-3. **Build the 16k Tokenizer (`kain/tokenizer/tokenizer_16k.kn`):** Byte-pair BPE tokenizer
-   mapping English and code bytes directly to compact integer vectors.
-4. **Validate Tensor Math Kernels (`kain/tensor/`):** Implement and prove the FWHT butterfly
-   addition network and 1.58-bit ternary dot products in `kain/spike/`.
-5. **Amalgamation & LLVM Build Verification:** Prove that modular source files cleanly
-   amalgamate into `kain/core.kn` and compile to native `kain/core.exe` with zero errors.
+We are executing the **Step 0 Pilot — Phase A (Assemble the Student)**.
+
+### Fused Suite Status (see `docs/status/` snapshots; verify live with `./kain/core.exe prove`)
+- **9 modules fused** via `kain amalgamate --raw kain/core -o kain/core.kn` → LLVM `kain/core.exe`.
+- **41/41 self-test checks green.** Per-module batteries: `_common` 6/6, `tokenizer_16k` 5/5,
+  `gemm_158b` 5/5, `activations` 5/5, `ssm_liquid` 5/5, `distill_loss` 5/5, `binary_packer` 5/5,
+  `config` 5/5. `dispatch` owns the only `main()` and routes `prove` + 8 subcommands
+  (`common`, `tokenizer`, `gemm`, `act`, `ssm`, `distill`, `pack`, `config`).
+- **Presets locked in `config.kn`:** Step-0 ≈ 134M params (~92MB ternary + 12.6MB fixed state),
+  Step-1 ≈ 1.31B params (~504MB + 50MB). Census/footprint estimators with tested bands.
+
+### Phase A Scoreboard (the learning machine, $0 spent, CPU only)
+- [x] **A1. `config.kn`** — hyperparameters, census, cross-module contract receipts.
+- [ ] **A2. Model forward** — embedding + N×(gemm→norm→swiglu→ssm) + LM-head → real logits.
+- [ ] **A3. Backward twins** — gradient kernel per forward kernel (SSM BPTT leads), each with
+  finite-difference numeric checks. This is the biggest remaining block.
+- [ ] **A4. Adam + 50-token overfit** — loss → ~0 on CPU. Proof the machine learns.
+
+### Phase B/C Pointer (do NOT start yet — Phase A is the critical path)
+- **Phase B (Python + data):** teacher setup in `python/` (Qwen-2.5-Coder, vocab slice to 16k),
+  `entropy_screener` + `ast_verifier` refinery, teacher-logit harvest → `train.kain_bin`.
+- **Phase C (forge):** Vast.ai RTX 4090s are rented and waiting. Vast boxes are **Linux** —
+  our binary is Windows LLVM; Phase C needs a `kain build --target linux` verification pass
+  on a cheap CPU box BEFORE burning GPU dollars. No GPU spend until A4's overfit hits ~0.
 
 We build with precision. Every file connects like glue.

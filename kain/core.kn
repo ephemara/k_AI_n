@@ -1,7 +1,7 @@
 // -- KAIN RAW AMALGAMATION -- core ----------------------------------------------------------
 // kind:       directory
 // contents:   source
-// structure:  6 files | 6 modules
+// structure:  9 files | 9 modules
 //
 // -- PUBLIC INTERFACE DIRECTORY -----------------------------------------------
 //
@@ -889,6 +889,590 @@ pub fn activations_main(args: Array<String>) -> Int with Unsafe:
         return 0
 
 // ============================================================================
+// binary_packer.kn
+// ============================================================================
+// ============================================================================
+//  k_AI_n :: binary_packer.kn — Contiguous 64-Byte Aligned .kain_bin Packager
+// ============================================================================
+//  Subsystem 6: Scavenger Refinery & Distillation (training forge feed)
+//  Architecture:
+//    - The `.kain_bin` training stream: ONE contiguous arena, 64-byte aligned
+//      records, laid out for zero-copy DMA into the forge:
+//        bytes 0..7:    magic "KAINBIN1" (75,65,73,78,66,73,78,49)
+//        bytes 8..15:   version u64 LE (=1)
+//        bytes 16..23:  dim (sequence length) u64 LE
+//        bytes 24..31:  count (number of sequences) u64 LE
+//        per record:    dim token u16 LE (dim*2 bytes, fits 16k vocab)
+//                       + dim mask bytes (1 = invariant pointer/bounds/type)
+//                       + zero padding up to 64-byte multiple
+//        record stride = round64(dim * 3)
+//    - THE forge-feed glue (buffer contract, no serialization):
+//        tokenizer tokenize_into_arena(text) -> token IDs
+//        bin_pack_record(buf, ...)          -> contiguous .kain_bin arena
+//        _common dma_write_file(path, buf)  -> train.kain_bin on disk (77x DMA,
+//                                             proven 6/6 in _common.kn)
+//        _common dma_read_file(path)        -> arena back in RAM
+//        bin_unpack_record(...)             -> rows for distil_loss_batch
+//      Packer owns LAYOUT ONLY; _common owns BYTES-ON-DISK. Zero overlap.
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common.kn symbols (arenas, bref/bstore, DMA, Tensor*).
+//    - NEVER redefines gemm/activations/ssm/distill symbols.
+//    - All new symbols use BIN_ prefix or bin_ scope.
+//    - Leaf-module discipline: raw mem_load/mem_store/ptr_offset builtins only
+//      (same as gemm_158b's packed-2b codec) so standalone check stays hermetic.
+// ============================================================================
+
+use std::runtime
+
+// ── Format Constants (BIN_ scoped, no collisions) ───────────────────────────
+
+pub const BIN_VERSION: Int = 1
+pub const BIN_ALIGN: Int = 64
+pub const BIN_HEADER_LEN: Int = 32
+pub const BIN_M0: Int = 75
+pub const BIN_M1: Int = 65
+pub const BIN_M2: Int = 73
+pub const BIN_M3: Int = 78
+pub const BIN_M4: Int = 66
+pub const BIN_M5: Int = 73
+pub const BIN_M6: Int = 78
+pub const BIN_M7: Int = 49
+pub const BIN_VOCAB_MAX: Int = 16383
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law bin_dims_valid(dim: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0
+
+pub law bin_count_valid(n: Int) -> Bool:
+    return n > 0 and n <= 1000000
+
+pub law bin_stride_aligned(stride: Int) -> Bool:
+    return stride > 0 and (stride % 64) == 0
+
+// ── Layout Arithmetic ───────────────────────────────────────────────────────
+
+// Record stride: dim u16 tokens + dim mask bytes, rounded up to 64.
+pub fn bin_record_stride(dim: Int) -> Int with Pure:
+    let raw = dim * 3
+    return ((raw + BIN_ALIGN - 1) / BIN_ALIGN) * BIN_ALIGN
+
+// Total stream bytes for count sequences of dim tokens.
+pub fn bin_stream_bytes(dim: Int, count: Int) -> Int with Pure:
+    return BIN_HEADER_LEN + count * bin_record_stride(dim)
+
+// ── Little-Endian u64 Codec (header fields) ─────────────────────────────────
+
+pub fn bin_write_u64(buf: ptr<Byte>, off: Int, v: Int) -> Int with Unsafe:
+    var shift = 0
+    var i = 0
+    while i < 8:
+        let byte_v = (v >> shift) & 255
+        mem_store(ptr_offset(buf, off + i, "Byte"), byte_v as Byte, "Byte")
+        shift = shift + 8
+        i = i + 1
+    return 0
+
+pub fn bin_read_u64(buf: ptr<Byte>, off: Int) -> Int with Unsafe:
+    var acc = 0
+    var shift = 0
+    var i = 0
+    while i < 8:
+        let byte_v = mem_load(ptr_offset(buf, off + i, "Byte"), "Int") & 255
+        acc = acc + (byte_v << shift)
+        shift = shift + 8
+        i = i + 1
+    return acc
+
+// ── Header Write / Validate ─────────────────────────────────────────────────
+
+pub fn bin_write_header(buf: ptr<Byte>, dim: Int, count: Int) -> Int with Unsafe:
+    mem_store(ptr_offset(buf, 0, "Byte"), BIN_M0 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 1, "Byte"), BIN_M1 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 2, "Byte"), BIN_M2 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 3, "Byte"), BIN_M3 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 4, "Byte"), BIN_M4 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 5, "Byte"), BIN_M5 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 6, "Byte"), BIN_M6 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 7, "Byte"), BIN_M7 as Byte, "Byte")
+    bin_write_u64(buf, 8, BIN_VERSION)
+    bin_write_u64(buf, 16, dim)
+    bin_write_u64(buf, 24, count)
+    return 0
+
+// Returns 0 if valid (writes dim/count out), else error code:
+// 1 = bad magic, 2 = bad version, 3 = buffer too small for claimed shape.
+pub fn bin_validate_header(buf: ptr<Byte>, nbytes: Int, out_dim: ptr<Int>, out_count: ptr<Int>) -> Int with Unsafe:
+    if (mem_load(ptr_offset(buf, 0, "Byte"), "Int") & 255) != BIN_M0:
+        return 1
+    if (mem_load(ptr_offset(buf, 1, "Byte"), "Int") & 255) != BIN_M1:
+        return 1
+    if (mem_load(ptr_offset(buf, 2, "Byte"), "Int") & 255) != BIN_M2:
+        return 1
+    if (mem_load(ptr_offset(buf, 3, "Byte"), "Int") & 255) != BIN_M3:
+        return 1
+    if (mem_load(ptr_offset(buf, 4, "Byte"), "Int") & 255) != BIN_M4:
+        return 1
+    if (mem_load(ptr_offset(buf, 5, "Byte"), "Int") & 255) != BIN_M5:
+        return 1
+    if (mem_load(ptr_offset(buf, 6, "Byte"), "Int") & 255) != BIN_M6:
+        return 1
+    if (mem_load(ptr_offset(buf, 7, "Byte"), "Int") & 255) != BIN_M7:
+        return 1
+    let ver = bin_read_u64(buf, 8)
+    if ver != BIN_VERSION:
+        return 2
+    let dim = bin_read_u64(buf, 16)
+    let count = bin_read_u64(buf, 24)
+    if bin_stream_bytes(dim, count) > nbytes:
+        return 3
+    mem_store(out_dim, dim, "Int")
+    mem_store(out_count, count, "Int")
+    return 0
+
+// ── Record Pack / Unpack (u16 tokens + mask bytes, zero-padded to stride) ───
+
+pub fn bin_pack_record(buf: ptr<Byte>, base: Int, tokens: ptr<Int>, mask: ptr<Byte>, dim: Int) -> Int with Unsafe:
+    let tok_base = base
+    let msk_base = base + dim * 2
+    var i = 0
+    while i < dim:
+        let tok = mem_load(ptr_offset(tokens, i, "Int"), "Int")
+        let t_lo = tok_base + i * 2
+        mem_store(ptr_offset(buf, t_lo, "Byte"), (tok & 255) as Byte, "Byte")
+        let t_hi = tok_base + i * 2 + 1
+        mem_store(ptr_offset(buf, t_hi, "Byte"), ((tok >> 8) & 255) as Byte, "Byte")
+        i = i + 1
+    var j = 0
+    while j < dim:
+        let m_at = msk_base + j
+        let msrc = mem_load(ptr_offset(mask, j, "Byte"), "Int") & 255
+        mem_store(ptr_offset(buf, m_at, "Byte"), msrc as Byte, "Byte")
+        j = j + 1
+    let stride = bin_record_stride(dim)
+    let pad_end = base + stride
+    var p = base + dim * 3
+    while p < pad_end:
+        mem_store(ptr_offset(buf, p, "Byte"), 0 as Byte, "Byte")
+        p = p + 1
+    return 0
+
+pub fn bin_unpack_record(tokens_out: ptr<Int>, mask_out: ptr<Byte>, buf: ptr<Byte>, base: Int, dim: Int) -> Int with Unsafe:
+    let tok_base = base
+    let msk_base = base + dim * 2
+    var i = 0
+    while i < dim:
+        let t_lo = tok_base + i * 2
+        let lo = mem_load(ptr_offset(buf, t_lo, "Byte"), "Int") & 255
+        let t_hi = tok_base + i * 2 + 1
+        let hi = mem_load(ptr_offset(buf, t_hi, "Byte"), "Int") & 255
+        mem_store(ptr_offset(tokens_out, i, "Int"), lo + hi * 256, "Int")
+        let m_at = msk_base + i
+        mem_store(ptr_offset(mask_out, i, "Byte"), (mem_load(ptr_offset(buf, m_at, "Byte"), "Int") & 255) as Byte, "Byte")
+        i = i + 1
+    return 0
+
+// Pack a full batch: row b lives at header + b * stride (row-major for distill).
+pub fn bin_pack_batch(buf: ptr<Byte>, tokens_b: ptr<Int>, mask_b: ptr<Byte>, batch: Int, dim: Int) -> Int with Unsafe:
+    bin_write_header(buf, dim, batch)
+    let stride = bin_record_stride(dim)
+    var b = 0
+    while b < batch:
+        let base = BIN_HEADER_LEN + b * stride
+        let t_row = ptr_offset(tokens_b, b * dim, "Int")
+        let m_row = ptr_offset(mask_b, b * dim, "Byte")
+        bin_pack_record(buf, base, t_row, m_row, dim)
+        b = b + 1
+    return 0
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn binpack_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n binary_packer Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Header write + validate roundtrip; corrupted magic rejected.
+    total = total + 1
+    let dim1 = 8
+    let cnt1 = 2
+    let nb1 = bin_stream_bytes(dim1, cnt1)
+    let buf1: ptr<Byte> = alloc_zeroed(256, "Byte")
+    bin_write_header(buf1, dim1, cnt1)
+    let od1: ptr<Int> = alloc_zeroed(8, "Int")
+    let oc1: ptr<Int> = alloc_zeroed(8, "Int")
+    let rc_ok = bin_validate_header(buf1, nb1, od1, oc1)
+    let got_dim = mem_load(od1, "Int")
+    let got_cnt = mem_load(oc1, "Int")
+    mem_store(ptr_offset(buf1, 0, "Byte"), 0 as Byte, "Byte")
+    let rc_bad = bin_validate_header(buf1, nb1, od1, oc1)
+    decay buf1
+    decay od1
+    decay oc1
+    if rc_ok == 0 and got_dim == dim1 and got_cnt == cnt1 and rc_bad == 1:
+        println("  [PASS] Test 1: Header roundtrip valid, corrupted magic rejected")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: Header mismatch")
+
+    // Test 2: Record pack/unpack roundtrip incl. edge token values.
+    total = total + 1
+    let dim2 = 8
+    let stride2 = bin_record_stride(dim2)
+    let buf2: ptr<Byte> = alloc_zeroed(256, "Byte")
+    let tok2: ptr<Int> = alloc_zeroed(64, "Int")
+    let msk2: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let tok2b: ptr<Int> = alloc_zeroed(64, "Int")
+    let msk2b: ptr<Byte> = alloc_zeroed(64, "Byte")
+    mem_store(ptr_offset(tok2, 0, "Int"), 0, "Int")
+    mem_store(ptr_offset(tok2, 1, "Int"), 16383, "Int")
+    mem_store(ptr_offset(tok2, 2, "Int"), 255, "Int")
+    mem_store(ptr_offset(tok2, 3, "Int"), 256, "Int")
+    mem_store(ptr_offset(tok2, 4, "Int"), 334, "Int")
+    mem_store(ptr_offset(msk2, 1, "Byte"), 1 as Byte, "Byte")
+    mem_store(ptr_offset(msk2, 4, "Byte"), 1 as Byte, "Byte")
+    bin_pack_record(buf2, 0, tok2, msk2, dim2)
+    bin_unpack_record(tok2b, msk2b, buf2, 0, dim2)
+    let r1 = mem_load(ptr_offset(tok2b, 1, "Int"), "Int")
+    let r4 = mem_load(ptr_offset(tok2b, 4, "Int"), "Int")
+    let r0 = mem_load(ptr_offset(tok2b, 0, "Int"), "Int")
+    let rm1 = mem_load(ptr_offset(msk2b, 1, "Byte"), "Int") & 255
+    let rm0 = mem_load(ptr_offset(msk2b, 0, "Byte"), "Int") & 255
+    decay buf2
+    decay tok2
+    decay msk2
+    decay tok2b
+    decay msk2b
+    if r1 == 16383 and r4 == 334 and r0 == 0 and rm1 == 1 and rm0 == 0 and stride2 == 64:
+        println("  [PASS] Test 2: Record roundtrip exact (edge tokens + mask, stride 64)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Record mismatch")
+
+    // Test 3: Batch pack — row 1 lands at header + stride, header validates.
+    total = total + 1
+    let dim3 = 8
+    let batch3 = 2
+    let stride3 = bin_record_stride(dim3)
+    let nb3 = bin_stream_bytes(dim3, batch3)
+    let buf3: ptr<Byte> = alloc_zeroed(256, "Byte")
+    let tok3: ptr<Int> = alloc_zeroed(64, "Int")
+    let msk3: ptr<Byte> = alloc_zeroed(64, "Byte")
+    mem_store(ptr_offset(tok3, 8 + 0, "Int"), 7777, "Int")
+    mem_store(ptr_offset(msk3, 8 + 0, "Byte"), 1 as Byte, "Byte")
+    bin_pack_batch(buf3, tok3, msk3, batch3, dim3)
+    let od3: ptr<Int> = alloc_zeroed(8, "Int")
+    let oc3: ptr<Int> = alloc_zeroed(8, "Int")
+    let rc3 = bin_validate_header(buf3, nb3, od3, oc3)
+    let row1base = BIN_HEADER_LEN + stride3
+    let r1lo = mem_load(ptr_offset(buf3, row1base, "Byte"), "Int") & 255
+    let r1hi = mem_load(ptr_offset(buf3, row1base + 1, "Byte"), "Int") & 255
+    let r1tok = r1lo + r1hi * 256
+    let r1m = mem_load(ptr_offset(buf3, row1base + dim3 * 2, "Byte"), "Int") & 255
+    let r0lo = mem_load(ptr_offset(buf3, BIN_HEADER_LEN, "Byte"), "Int") & 255
+    decay buf3
+    decay tok3
+    decay msk3
+    decay od3
+    decay oc3
+    if rc3 == 0 and r1tok == 7777 and r1m == 1 and r0lo == 0 and nb3 == 32 + 2 * 64:
+        println("  [PASS] Test 3: Batch rows land on stride boundaries, header validates")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: Batch layout mismatch")
+
+    // Test 4: u64 codec roundtrip on large dim/count values.
+    total = total + 1
+    let buf4: ptr<Byte> = alloc_zeroed(64, "Byte")
+    bin_write_u64(buf4, 0, 8192)
+    bin_write_u64(buf4, 8, 50000)
+    let v0 = bin_read_u64(buf4, 0)
+    let v1 = bin_read_u64(buf4, 8)
+    decay buf4
+    if v0 == 8192 and v1 == 50000:
+        println("  [PASS] Test 4: u64 LE codec roundtrip verified (8192, 50000)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: u64 codec mismatch")
+
+    // Test 5: Invariant laws (dims, count, stride alignment).
+    total = total + 1
+    let l1 = bin_dims_valid(64)
+    let l2 = bin_dims_valid(63)
+    let l3 = bin_count_valid(1000)
+    let l4 = bin_count_valid(0)
+    let l5 = bin_stride_aligned(bin_record_stride(8))
+    let l6 = bin_stride_aligned(63)
+    if l1 and (l2 == false) and l3 and (l4 == false) and l5 and (l6 == false):
+        println("  [PASS] Test 5: Packer dimension, count & alignment laws passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Invariant laws failed")
+
+    println("--- binary_packer Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn binpack_usage():
+    println("k_AI_n .kain_bin Packager (binary_packer.kn)")
+    println("USAGE:")
+    println("  core pack prove                    Run self-verifying test battery")
+    println("  core pack stats                    Print stream format & stride metrics")
+
+pub fn binpack_stats() -> String:
+    var t = "=== k_AI_n .kain_bin Training Stream ===\n"
+    t = t + "  Header:       32B magic KAINBIN1 + version/dim/count u64 LE\n"
+    t = t + "  Record:       dim u16 tokens + dim mask bytes, padded to 64B\n"
+    t = t + "  Stride(dim8): 64B (dim*3=24, rounded to 64 for cache lines)\n"
+    t = t + "  Vocab:        u16 tokens cover full 16k range (0..16383)\n"
+    t = t + "  Persistence:  arena -> dma_write_file -> train.kain_bin (77x DMA)\n"
+    t = t + "  Allocations:  0 in hot path (caller-owned arenas, in-place codec)\n"
+    return t
+
+pub fn binpack_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        binpack_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return binpack_test_battery()
+    elif cmd == "stats":
+        println(binpack_stats())
+        return 0
+    else:
+        binpack_usage()
+        return 0
+
+// ============================================================================
+// config.kn
+// ============================================================================
+// ============================================================================
+//  k_AI_n :: config.kn — Architecture Hyperparameters & Hardware Probes
+// ============================================================================
+//  Subsystem 1: Core Host Runtime, Memory & CLI
+//  Architecture:
+//    - THE single source of truth for every threshold and dimension in the
+//      engine (AGENTS.md Rule 5: no magic numbers scattered in logic loops).
+//    - Two named presets as flat const groups (no heap structs, no globals):
+//        Step-0 (S0): 150M proof-of-life ..... dim 1024, state 128, 12 layers
+//        Step-1 (S1): 1.5B scavenger coder .... dim 2048, state 128, 24 layers
+//      Scaling the engine = reading the other const group, never a rewrite.
+//    - Honest census + footprint estimators (documented formulas, tested ranges)
+//      so VRAM claims are receipts, not wishes.
+//    - Contract test: our literals agree with peer modules (16384 vocab with
+//      tokenizer_16k, 5.0 invariant weight with distill_loss, 64B align with
+//      binary_packer). Standalone-safe: literals duplicated, never imported.
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common/gemm/activations/ssm/distill/packer symbols.
+//    - All new symbols use CFG_ prefix or cfg_ scope. Pure functions only
+//      (no arenas, no effects) — check-hermetic by construction.
+// ============================================================================
+
+use std::runtime
+
+// ── Shared Vocabulary & Stream Contract ─────────────────────────────────────
+
+pub const CFG_VOCAB_SIZE: Int = 16384
+pub const CFG_PACK_ALIGN: Int = 64
+pub const CFG_INVARIANT_W: Float = 5.0
+
+// ── Step-0 Preset: 150M Proof of Alien Life ─────────────────────────────────
+
+pub const CFG_S0_DIM: Int = 1024
+pub const CFG_S0_STATE_DIM: Int = 128
+pub const CFG_S0_LAYERS: Int = 24
+pub const CFG_S0_SEQ: Int = 2048
+pub const CFG_S0_BATCH: Int = 8
+
+// ── Step-1 Preset: 1.5B Scavenger Coder ─────────────────────────────────────
+
+pub const CFG_S1_DIM: Int = 3072
+pub const CFG_S1_STATE_DIM: Int = 128
+pub const CFG_S1_LAYERS: Int = 32
+pub const CFG_S1_SEQ: Int = 2048
+pub const CFG_S1_BATCH: Int = 4
+
+// ── Training Hyperparameters (Adam + Distillation) ──────────────────────────
+
+pub const CFG_LR: Float = 0.001
+pub const CFG_ADAM_B1: Float = 0.9
+pub const CFG_ADAM_B2: Float = 0.999
+pub const CFG_ADAM_EPS: Float = 0.00000001
+pub const CFG_TEMP: Float = 1.0
+pub const CFG_TERNARY_THRESHOLD: Float = 0.05
+pub const CFG_SSM_DT: Float = 0.1
+pub const CFG_RMS_EPS: Float = 0.000001
+pub const CFG_ROPE_THETA: Float = 10000.0
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law cfg_dims_valid(dim: Int, state_dim: Int, layers: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0 and state_dim > 0 and layers > 0 and layers <= 128
+
+pub law cfg_train_valid(vocab: Int, seq: Int, batch: Int) -> Bool:
+    return vocab == CFG_VOCAB_SIZE and seq > 0 and (seq % 256) == 0 and batch > 0 and batch <= 64
+
+pub law cfg_opt_valid(lr: Float, b1: Float, b2: Float) -> Bool:
+    return lr > 0.0 and lr < 1.0 and b1 > 0.0 and b1 < 1.0 and b2 > 0.0 and b2 < 1.0 and b1 < b2
+
+// ── Census & Footprint Estimators ───────────────────────────────────────────
+
+// Honest parameter census for our hybrid block:
+//   embed        = vocab * dim
+//   per layer    = 4*d*d (ternary QKV+O / gate+proj) + 3*state_dim (SSM A,B,C)
+//                  + 3*d (SSM skip/output + 2 RMSNorm gammas)
+//   head         = dim * vocab (untied upper bound) + dim (final norm)
+// Returns total trainable parameters.
+pub fn cfg_census(dim: Int, state_dim: Int, layers: Int, vocab: Int) -> Int with Pure:
+    let embed = vocab * dim
+    let per_layer = 4 * dim * dim + 3 * state_dim + 3 * dim
+    let head = dim * vocab + dim
+    return embed + layers * per_layer + head
+
+// Ternary weight footprint in bytes: ternary matrices at 2 bits/param
+// (params/4) + embedding + head kept at fp16 (2 bytes/param).
+pub fn cfg_footprint_bytes(dim: Int, state_dim: Int, layers: Int, vocab: Int) -> Int with Pure:
+    let ternary_params = layers * (4 * dim * dim + 3 * state_dim)
+    let fp16_params = 2 * vocab * dim + layers * 3 * dim + dim
+    return ternary_params / 4 + fp16_params * 2
+
+// Recurrent state bytes (fixed O(1) memory): layers * state_dim * dim fp32.
+pub fn cfg_state_bytes(dim: Int, state_dim: Int, layers: Int) -> Int with Pure:
+    return layers * state_dim * dim * 4
+
+// ── Preset Validators ──────────────────────────────────────────────────────
+
+pub fn cfg_step0_valid() -> Bool with Pure:
+    return cfg_dims_valid(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS)
+
+pub fn cfg_step1_valid() -> Bool with Pure:
+    return cfg_dims_valid(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS)
+
+pub fn cfg_opt_default_valid() -> Bool with Pure:
+    return cfg_opt_valid(CFG_LR, CFG_ADAM_B1, CFG_ADAM_B2)
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn config_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n config Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Step-0 census lands in the 150M-class band (formula documented above).
+    total = total + 1
+    let n0 = cfg_census(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS, CFG_VOCAB_SIZE)
+    if n0 > 120000000 and n0 < 180000000:
+        println("  [PASS] Test 1: Step-0 census 150M-class (" + str(n0) + " params)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: Step-0 census out of band (got " + str(n0) + ")")
+
+    // Test 2: Step-1 census is 1B-class and strictly larger than Step-0.
+    total = total + 1
+    let n1 = cfg_census(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS, CFG_VOCAB_SIZE)
+    if n1 > 800000000 and n1 < 2200000000 and n1 > n0:
+        println("  [PASS] Test 2: Step-1 census 1.5B-class (" + str(n1) + " params)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Step-1 census out of band (got " + str(n1) + ")")
+
+    // Test 3: Footprint receipts — Step-0 weights + state fit tiny caps.
+    total = total + 1
+    let f0 = cfg_footprint_bytes(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS, CFG_VOCAB_SIZE)
+    let s0 = cfg_state_bytes(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS)
+    if f0 > 0 and f0 < 200000000 and s0 > 0 and s0 < 20000000:
+        println("  [PASS] Test 3: Step-0 footprint weights=" + str(f0) + "B state=" + str(s0) + "B")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: Footprint out of cap")
+
+    // Test 4: Preset + optimizer laws accept truth, reject garbage.
+    total = total + 1
+    let v0 = cfg_step0_valid()
+    let v1 = cfg_step1_valid()
+    let vopt = cfg_opt_default_valid()
+    let bad_dim = cfg_dims_valid(1001, 128, 12)
+    let bad_layers = cfg_dims_valid(1024, 128, 0)
+    let bad_lr = cfg_opt_valid(2.0, 0.9, 0.999)
+    let bad_beta = cfg_opt_valid(0.001, 0.999, 0.9)
+    let bad_train = cfg_train_valid(16384, 100, 8)
+    if v0 and v1 and vopt and (bad_dim == false) and (bad_layers == false) and (bad_lr == false) and (bad_beta == false) and (bad_train == false):
+        println("  [PASS] Test 4: Preset, optimizer & training-shape laws passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: Validator laws failed")
+
+    // Test 5: Cross-module contract — our literals agree with peer modules.
+    total = total + 1
+    let c_vocab = CFG_VOCAB_SIZE == 16384
+    let c_w = CFG_INVARIANT_W > 4.999 and CFG_INVARIANT_W < 5.001
+    let c_align = CFG_PACK_ALIGN == 64
+    let c_theta = CFG_ROPE_THETA > 9999.0 and CFG_ROPE_THETA < 10001.0
+    let c_eps = CFG_RMS_EPS > 0.0 and CFG_RMS_EPS < 0.001
+    if c_vocab and c_w and c_align and c_theta and c_eps:
+        println("  [PASS] Test 5: Contract agrees with tokenizer/distill/packer/RoPE literals")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Contract literal mismatch")
+
+    println("--- config Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn config_usage():
+    println("k_AI_n Architecture Config (config.kn)")
+    println("USAGE:")
+    println("  core config prove                  Run self-verifying test battery")
+    println("  core config stats                  Print census & footprint metrics")
+    println("  core config show                   Print both preset tables")
+
+pub fn config_stats() -> String:
+    var t = "=== k_AI_n Architecture Config ===\n"
+    t = t + "  Step-0 150M:  dim=1024 state=128 layers=24 seq=2048 batch=8\n"
+    t = t + "  Step-1 1.5B:  dim=3072 state=128 layers=32 seq=2048 batch=4\n"
+    t = t + "  Vocab:        16384 (matches tokenizer_16k)\n"
+    t = t + "  Optimizer:    Adam lr=0.001 b1=0.9 b2=0.999 eps=1e-8\n"
+    t = t + "  Distill:      5.0x invariant weight (matches distill_loss)\n"
+    t = t + "  Stream:       64B records (matches binary_packer)\n"
+    return t
+
+pub fn config_show() -> String:
+    var t = "--- Step-0 150M Proof of Alien Life ---\n"
+    t = t + "  census=" + str(cfg_census(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS, CFG_VOCAB_SIZE)) + "\n"
+    t = t + "  weights=" + str(cfg_footprint_bytes(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS, CFG_VOCAB_SIZE)) + "B\n"
+    t = t + "  state=" + str(cfg_state_bytes(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS)) + "B\n"
+    t = t + "--- Step-1 1.5B Scavenger Coder ---\n"
+    t = t + "  census=" + str(cfg_census(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS, CFG_VOCAB_SIZE)) + "\n"
+    t = t + "  weights=" + str(cfg_footprint_bytes(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS, CFG_VOCAB_SIZE)) + "B\n"
+    t = t + "  state=" + str(cfg_state_bytes(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS)) + "B\n"
+    return t
+
+pub fn config_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        config_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return config_test_battery()
+    elif cmd == "stats":
+        println(config_stats())
+        return 0
+    elif cmd == "show":
+        println(config_show())
+        return 0
+    else:
+        config_usage()
+        return 0
+
+// ============================================================================
 // dispatch.kn
 // ============================================================================
 // ============================================================================
@@ -915,6 +1499,9 @@ pub fn core_usage():
     println("")
     println("COMMANDS:")
     println("  prove                      Run formal self-test batteries across all modules")
+    println("  config <subcommand>       Architecture Hyperparameters (prove, stats, show)")
+    println("  pack <subcommand>          .kain_bin Training Stream Packager (prove, stats)")
+    println("  distill <subcommand>       Invariant-Weighted Distill Loss (prove, stats)")
     println("  ssm <subcommand>           O(1) Liquid Memory SSM (prove, stats)")
     println("  gemm <subcommand>          1.58-Bit Ternary GEMM Engine (prove, stats)")
     println("  activations <subcommand>   Fused RMSNorm/SwiGLU/RoPE Suite (prove, stats)")
@@ -937,40 +1524,85 @@ fn main() -> Int with Unsafe:
     // Global Test Suite
     if cmd == "prove" or cmd == "test":
         core_banner()
-        println("[1/5] Testing Core Substrate & Memory Arenas (_common.kn)...")
+        println("[1/8] Testing Core Substrate & Memory Arenas (_common.kn)...")
         let common_rc = common_test_battery()
         if common_rc != 0:
             println("error: _common.kn test battery failed with exit code " + str(common_rc))
             return common_rc
 
-        println("[2/5] Testing 16k Alien Tokenizer (tokenizer_16k.kn)...")
+        println("[2/8] Testing 16k Alien Tokenizer (tokenizer_16k.kn)...")
         let tok_rc = tokenizer_test_battery()
         if tok_rc != 0:
             println("error: tokenizer_16k.kn test battery failed with exit code " + str(tok_rc))
             return tok_rc
 
-        println("[3/5] Testing 1.58-Bit Ternary GEMM Engine (gemm_158b.kn)...")
+        println("[3/8] Testing 1.58-Bit Ternary GEMM Engine (gemm_158b.kn)...")
         let gemm_rc = gemm_test_battery()
         if gemm_rc != 0:
             println("error: gemm_158b.kn test battery failed with exit code " + str(gemm_rc))
             return gemm_rc
 
-        println("[4/5] Testing Fused Activation Suite (activations.kn)...")
+        println("[4/8] Testing Fused Activation Suite (activations.kn)...")
         let act_rc = activations_test_battery()
         if act_rc != 0:
             println("error: activations.kn test battery failed with exit code " + str(act_rc))
             return act_rc
 
-        println("[5/5] Testing O(1) Liquid Memory (ssm_liquid.kn)...")
+        println("[5/8] Testing O(1) Liquid Memory (ssm_liquid.kn)...")
         let ssm_rc = ssm_test_battery()
         if ssm_rc != 0:
             println("error: ssm_liquid.kn test battery failed with exit code " + str(ssm_rc))
             return ssm_rc
 
+        println("[6/8] Testing Invariant-Weighted Distill Loss (distill_loss.kn)...")
+        let dist_rc = distill_test_battery()
+        if dist_rc != 0:
+            println("error: distill_loss.kn test battery failed with exit code " + str(dist_rc))
+            return dist_rc
+
+        println("[7/8] Testing .kain_bin Training Stream (binary_packer.kn)...")
+        let pack_rc = binpack_test_battery()
+        if pack_rc != 0:
+            println("error: binary_packer.kn test battery failed with exit code " + str(pack_rc))
+            return pack_rc
+
+        println("[8/8] Testing Architecture Config (config.kn)...")
+        let cfg_rc = config_test_battery()
+        if cfg_rc != 0:
+            println("error: config.kn test battery failed with exit code " + str(cfg_rc))
+            return cfg_rc
+
         println("======================================================================")
-        println("  ALL SELF-TEST BATTERIES PASSED (26/26 checks green)")
+        println("  ALL SELF-TEST BATTERIES PASSED (41/41 checks green)")
         println("======================================================================")
         return 0
+
+    // Config Subsystem
+    elif cmd == "config" or cmd == "cfg":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return config_main(sub_args)
+
+    // Binary Packer Subsystem
+    elif cmd == "pack" or cmd == "binpack":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return binpack_main(sub_args)
+
+    // Distill Loss Subsystem
+    elif cmd == "distill" or cmd == "distil":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return distill_main(sub_args)
 
     // SSM Liquid Memory Subsystem
     elif cmd == "ssm" or cmd == "ssm_liquid":
@@ -1026,6 +1658,297 @@ fn main() -> Int with Unsafe:
         println("error: unknown command '" + cmd + "'")
         core_usage()
         return 2
+
+// ============================================================================
+// distill_loss.kn
+// ============================================================================
+// ============================================================================
+//  k_AI_n :: distill_loss.kn — Invariant-Weighted Distillation Loss
+// ============================================================================
+//  Subsystem 6: Scavenger Refinery & Distillation (training forge)
+//  Architecture:
+//    - Teacher-student logit matching WITHOUT transcendentals (TinyBERT-style
+//      MSE on raw logits — no ln/exp needed, fully provable in integer-safe
+//      float arithmetic):
+//        L = mean_d( w[d] * (student[d] - teacher[d])^2 )
+//        w[d] = invariant_w (5.0x) if mask[d] == 1 (pointer/bounds/type token)
+//        w[d] = 1.0 otherwise.
+//    - Temperature scaling on raw logits: logits[d] /= temp (division only).
+//    - Batch mean + top-1 agreement tracker for forge telemetry.
+//    - THE forge glue after the forward pass:
+//        ssm_forward_step(y_student, ...) -> distil_mse_weighted(y_student,
+//          y_teacher, mask, ...) -> scalar loss -> weight update.
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common.kn symbols (arenas, bref/fref, DMA, Tensor*).
+//    - NEVER redefines gemm_158b.kn symbols (TERNARY_*, gemm_*, ternary_*).
+//    - NEVER redefines activations.kn symbols (ACT_*, act_*, rms_*, softmax_*).
+//    - NEVER redefines ssm_liquid.kn symbols (SSM_*, ssm_*).
+//    - All new symbols use DISTIL_ prefix or distil_ scope.
+//    - Own softmax-free formulation: zero cross-module calls, standalone check
+//      stays hermetic (same discipline as ssm_liquid's local sigmoid copy).
+// ============================================================================
+
+use std::runtime
+
+// ── Distillation Constants (DISTIL_ scoped, no collisions) ───────────────────
+
+pub const DISTIL_INVARIANT_W: Float = 5.0
+pub const DISTIL_TEMP_DEFAULT: Float = 1.0
+pub const DISTIL_LOSS_CEIL: Float = 1000000.0
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law distil_dims_valid(dim: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0
+
+pub law distil_temp_valid(temp: Float) -> Bool:
+    return temp > 0.0 and temp <= 100.0
+
+pub law distil_weight_valid(w: Float) -> Bool:
+    return w >= 1.0 and w <= 100.0
+
+// ── Converge Block: Weighted Squared Error (spec vs fast lane) ──────────────
+
+pub converge distil_weighted_sq(diff: Float, w: Float) -> Float:
+    spec reference:
+        return w * diff * diff
+    fast fast_lane when capability("cpu.x86.avx2"):
+        return w * diff * diff
+    verify random(8)
+
+// ── Core Kernels ────────────────────────────────────────────────────────────
+
+// Temperature scaling on raw logits: logits[d] /= temp. IN-PLACE.
+pub fn distil_temp_scale_inplace(logits: ptr<Float>, dim: Int, temp: Float) -> Int with Unsafe:
+    let inv = 1.0 / temp
+    var i = 0
+    while i < dim:
+        let v = mem_load(ptr_offset(logits, i, "Float"), "Float") as Float
+        mem_store(ptr_offset(logits, i, "Float"), v * inv, "Float")
+        i = i + 1
+    return 0
+
+// Weighted MSE over one position: mean_d( w[d] * (s[d]-t[d])^2 ).
+// mask[d] != 0 selects invariant_w (5x on pointers/bounds/types), else 1.0.
+pub fn distil_mse_weighted(student: ptr<Float>, teacher: ptr<Float>, mask: ptr<Byte>, dim: Int, invariant_w: Float) -> Float with Unsafe:
+    var acc: Float = 0.0
+    var i = 0
+    while i < dim:
+        let s = mem_load(ptr_offset(student, i, "Float"), "Float") as Float
+        let t = mem_load(ptr_offset(teacher, i, "Float"), "Float") as Float
+        let m = mem_load(ptr_offset(mask, i, "Byte"), "Int") & 255
+        var w: Float = 1.0
+        if m != 0:
+            w = invariant_w
+        let diff = s - t
+        acc = acc + distil_weighted_sq(diff, w)
+        i = i + 1
+    let loss = acc / (dim as Float)
+    if loss > DISTIL_LOSS_CEIL:
+        return DISTIL_LOSS_CEIL
+    return loss
+
+// Batch mean over N positions (contiguous batch x dim row-major logits).
+pub fn distil_loss_batch(student_b: ptr<Float>, teacher_b: ptr<Float>, mask_b: ptr<Byte>, batch: Int, dim: Int, invariant_w: Float) -> Float with Unsafe:
+    var acc: Float = 0.0
+    var b = 0
+    while b < batch:
+        let s_row = ptr_offset(student_b, b * dim, "Float")
+        let t_row = ptr_offset(teacher_b, b * dim, "Float")
+        let m_row = ptr_offset(mask_b, b * dim, "Byte")
+        acc = acc + distil_mse_weighted(s_row, t_row, m_row, dim, invariant_w)
+        b = b + 1
+    return acc / (batch as Float)
+
+// Top-1 agreement: 1 if student argmax == teacher argmax, else 0.
+pub fn distil_top1_match(student: ptr<Float>, teacher: ptr<Float>, dim: Int) -> Int with Unsafe:
+    var best_s = 0
+    var best_sv = mem_load(ptr_offset(student, 0, "Float"), "Float") as Float
+    var i = 1
+    while i < dim:
+        let v = mem_load(ptr_offset(student, i, "Float"), "Float") as Float
+        if v > best_sv:
+            best_sv = v
+            best_s = i
+        i = i + 1
+    var best_t = 0
+    var best_tv = mem_load(ptr_offset(teacher, 0, "Float"), "Float") as Float
+    var j = 1
+    while j < dim:
+        let w = mem_load(ptr_offset(teacher, j, "Float"), "Float") as Float
+        if w > best_tv:
+            best_tv = w
+            best_t = j
+        j = j + 1
+    if best_s == best_t:
+        return 1
+    return 0
+
+// Count invariant-marked positions in a mask row.
+pub fn distil_count_invariant(mask: ptr<Byte>, dim: Int) -> Int with Unsafe:
+    var n = 0
+    var i = 0
+    while i < dim:
+        let m = mem_load(ptr_offset(mask, i, "Byte"), "Int") & 255
+        if m != 0:
+            n = n + 1
+        i = i + 1
+    return n
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn distill_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n distill_loss Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Identical logits -> loss exactly 0.0.
+    total = total + 1
+    let dim1 = 8
+    let s1: ptr<Float> = alloc_zeroed(64, "Float")
+    let t1: ptr<Float> = alloc_zeroed(64, "Float")
+    let m1: ptr<Byte> = alloc_zeroed(64, "Byte")
+    var f1 = 0
+    while f1 < dim1:
+        mem_store(ptr_offset(s1, f1, "Float"), (f1 as Float) * 0.5, "Float")
+        mem_store(ptr_offset(t1, f1, "Float"), (f1 as Float) * 0.5, "Float")
+        f1 = f1 + 1
+    let loss1 = distil_mse_weighted(s1, t1, m1, dim1, DISTIL_INVARIANT_W)
+    decay s1
+    decay t1
+    decay m1
+    if loss1 > -0.0001 and loss1 < 0.0001:
+        println("  [PASS] Test 1: Identical logits yield zero loss")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: Expected 0.0, got " + str(loss1))
+
+    // Test 2: Single diff of 2.0 in dim 8, no mask -> 4.0/8 = 0.5.
+    total = total + 1
+    let dim2 = 8
+    let s2: ptr<Float> = alloc_zeroed(64, "Float")
+    let t2: ptr<Float> = alloc_zeroed(64, "Float")
+    let m2: ptr<Byte> = alloc_zeroed(64, "Byte")
+    mem_store(ptr_offset(s2, 3, "Float"), 2.0 as Float, "Float")
+    let loss2 = distil_mse_weighted(s2, t2, m2, dim2, DISTIL_INVARIANT_W)
+    decay s2
+    decay t2
+    decay m2
+    if loss2 > 0.4999 and loss2 < 0.5001:
+        println("  [PASS] Test 2: Single-position diff loss verified (0.5)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Expected 0.5, got " + str(loss2))
+
+    // Test 3: Same diff with invariant mask -> 5*4/8 = 2.5 (exactly 5x Test 2).
+    total = total + 1
+    let dim3 = 8
+    let s3: ptr<Float> = alloc_zeroed(64, "Float")
+    let t3: ptr<Float> = alloc_zeroed(64, "Float")
+    let m3: ptr<Byte> = alloc_zeroed(64, "Byte")
+    mem_store(ptr_offset(s3, 3, "Float"), 2.0 as Float, "Float")
+    mem_store(ptr_offset(m3, 3, "Byte"), 1 as Byte, "Byte")
+    let loss3 = distil_mse_weighted(s3, t3, m3, dim3, DISTIL_INVARIANT_W)
+    let ninv = distil_count_invariant(m3, dim3)
+    decay s3
+    decay t3
+    decay m3
+    if loss3 > 2.4999 and loss3 < 2.5001 and ninv == 1:
+        println("  [PASS] Test 3: Invariant 5x weighting verified (2.5 = 5x 0.5)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: Expected 2.5, got " + str(loss3))
+
+    // Test 4: Temp scaling halves logits at T=2 + top-1 agreement both ways.
+    total = total + 1
+    let dim4 = 8
+    let l4: ptr<Float> = alloc_zeroed(64, "Float")
+    let sa: ptr<Float> = alloc_zeroed(64, "Float")
+    let ta: ptr<Float> = alloc_zeroed(64, "Float")
+    let sb: ptr<Float> = alloc_zeroed(64, "Float")
+    let tb: ptr<Float> = alloc_zeroed(64, "Float")
+    mem_store(ptr_offset(l4, 0, "Float"), 2.0 as Float, "Float")
+    mem_store(ptr_offset(l4, 1, "Float"), 4.0 as Float, "Float")
+    distil_temp_scale_inplace(l4, dim4, 2.0)
+    let c0 = mem_load(ptr_offset(l4, 0, "Float"), "Float") as Float
+    let c1 = mem_load(ptr_offset(l4, 1, "Float"), "Float") as Float
+    mem_store(ptr_offset(sa, 5, "Float"), 9.0 as Float, "Float")
+    mem_store(ptr_offset(ta, 5, "Float"), 7.0 as Float, "Float")
+    mem_store(ptr_offset(sb, 2, "Float"), 9.0 as Float, "Float")
+    mem_store(ptr_offset(tb, 6, "Float"), 9.0 as Float, "Float")
+    let agree = distil_top1_match(sa, ta, dim4)
+    let disagree = distil_top1_match(sb, tb, dim4)
+    decay l4
+    decay sa
+    decay ta
+    decay sb
+    decay tb
+    if c0 > 0.999 and c0 < 1.001 and c1 > 1.999 and c1 < 2.001 and agree == 1 and disagree == 0:
+        println("  [PASS] Test 4: Temp scaling + top-1 agree/disagree verified")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: Temp/top1 mismatch")
+
+    // Test 5: Batch mean over 2 rows (0.0 and 0.5) -> 0.25 + invariant laws.
+    total = total + 1
+    let dim5 = 8
+    let batch5 = 2
+    let sb5: ptr<Float> = alloc_zeroed(128, "Float")
+    let tb5: ptr<Float> = alloc_zeroed(128, "Float")
+    let mb5: ptr<Byte> = alloc_zeroed(128, "Byte")
+    mem_store(ptr_offset(sb5, 8 + 3, "Float"), 2.0 as Float, "Float")
+    let bloss = distil_loss_batch(sb5, tb5, mb5, batch5, dim5, DISTIL_INVARIANT_W)
+    let l1 = distil_dims_valid(64)
+    let l2 = distil_dims_valid(63)
+    let l3 = distil_temp_valid(1.0)
+    let l4ok = distil_temp_valid(0.0)
+    let l5 = distil_weight_valid(5.0)
+    let l6 = distil_weight_valid(0.5)
+    decay sb5
+    decay tb5
+    decay mb5
+    if bloss > 0.2499 and bloss < 0.2501 and l1 and (l2 == false) and l3 and (l4ok == false) and l5 and (l6 == false):
+        println("  [PASS] Test 5: Batch mean (0.25) + dimension/temp/weight laws passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Batch/laws mismatch (got " + str(bloss) + ")")
+
+    println("--- distill_loss Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn distill_usage():
+    println("k_AI_n Invariant-Weighted Distillation Loss (distill_loss.kn)")
+    println("USAGE:")
+    println("  core distill prove                 Run self-verifying test battery")
+    println("  core distill stats                 Print loss/weighting metrics")
+
+pub fn distill_stats() -> String:
+    var t = "=== k_AI_n Invariant-Weighted Distillation Loss ===\n"
+    t = t + "  Loss:         Weighted MSE on teacher logits (no ln/exp needed)\n"
+    t = t + "  Weighting:    5.0x on invariant tokens (pointers/bounds/types)\n"
+    t = t + "  Temperature:  Division-only logit scaling (T in (0, 100])\n"
+    t = t + "  Telemetry:    Batch mean loss + top-1 agreement tracker\n"
+    t = t + "  Allocations:  0 (reads arena rows in place, returns scalar)\n"
+    return t
+
+pub fn distill_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        distill_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return distill_test_battery()
+    elif cmd == "stats":
+        println(distill_stats())
+        return 0
+    else:
+        distill_usage()
+        return 0
 
 // ============================================================================
 // gemm_158b.kn

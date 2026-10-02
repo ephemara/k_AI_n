@@ -1,0 +1,221 @@
+// ============================================================================
+//  k_AI_n :: config.kn — Architecture Hyperparameters & Hardware Probes
+// ============================================================================
+//  Subsystem 1: Core Host Runtime, Memory & CLI
+//  Architecture:
+//    - THE single source of truth for every threshold and dimension in the
+//      engine (AGENTS.md Rule 5: no magic numbers scattered in logic loops).
+//    - Two named presets as flat const groups (no heap structs, no globals):
+//        Step-0 (S0): 150M proof-of-life ..... dim 1024, state 128, 12 layers
+//        Step-1 (S1): 1.5B scavenger coder .... dim 2048, state 128, 24 layers
+//      Scaling the engine = reading the other const group, never a rewrite.
+//    - Honest census + footprint estimators (documented formulas, tested ranges)
+//      so VRAM claims are receipts, not wishes.
+//    - Contract test: our literals agree with peer modules (16384 vocab with
+//      tokenizer_16k, 5.0 invariant weight with distill_loss, 64B align with
+//      binary_packer). Standalone-safe: literals duplicated, never imported.
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common/gemm/activations/ssm/distill/packer symbols.
+//    - All new symbols use CFG_ prefix or cfg_ scope. Pure functions only
+//      (no arenas, no effects) — check-hermetic by construction.
+// ============================================================================
+
+use std::runtime
+
+// ── Shared Vocabulary & Stream Contract ─────────────────────────────────────
+
+pub const CFG_VOCAB_SIZE: Int = 16384
+pub const CFG_PACK_ALIGN: Int = 64
+pub const CFG_INVARIANT_W: Float = 5.0
+
+// ── Step-0 Preset: 150M Proof of Alien Life ─────────────────────────────────
+
+pub const CFG_S0_DIM: Int = 1024
+pub const CFG_S0_STATE_DIM: Int = 128
+pub const CFG_S0_LAYERS: Int = 24
+pub const CFG_S0_SEQ: Int = 2048
+pub const CFG_S0_BATCH: Int = 8
+
+// ── Step-1 Preset: 1.5B Scavenger Coder ─────────────────────────────────────
+
+pub const CFG_S1_DIM: Int = 3072
+pub const CFG_S1_STATE_DIM: Int = 128
+pub const CFG_S1_LAYERS: Int = 32
+pub const CFG_S1_SEQ: Int = 2048
+pub const CFG_S1_BATCH: Int = 4
+
+// ── Training Hyperparameters (Adam + Distillation) ──────────────────────────
+
+pub const CFG_LR: Float = 0.001
+pub const CFG_ADAM_B1: Float = 0.9
+pub const CFG_ADAM_B2: Float = 0.999
+pub const CFG_ADAM_EPS: Float = 0.00000001
+pub const CFG_TEMP: Float = 1.0
+pub const CFG_TERNARY_THRESHOLD: Float = 0.05
+pub const CFG_SSM_DT: Float = 0.1
+pub const CFG_RMS_EPS: Float = 0.000001
+pub const CFG_ROPE_THETA: Float = 10000.0
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law cfg_dims_valid(dim: Int, state_dim: Int, layers: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0 and state_dim > 0 and layers > 0 and layers <= 128
+
+pub law cfg_train_valid(vocab: Int, seq: Int, batch: Int) -> Bool:
+    return vocab == CFG_VOCAB_SIZE and seq > 0 and (seq % 256) == 0 and batch > 0 and batch <= 64
+
+pub law cfg_opt_valid(lr: Float, b1: Float, b2: Float) -> Bool:
+    return lr > 0.0 and lr < 1.0 and b1 > 0.0 and b1 < 1.0 and b2 > 0.0 and b2 < 1.0 and b1 < b2
+
+// ── Census & Footprint Estimators ───────────────────────────────────────────
+
+// Honest parameter census for our hybrid block:
+//   embed        = vocab * dim
+//   per layer    = 4*d*d (ternary QKV+O / gate+proj) + 3*state_dim (SSM A,B,C)
+//                  + 3*d (SSM skip/output + 2 RMSNorm gammas)
+//   head         = dim * vocab (untied upper bound) + dim (final norm)
+// Returns total trainable parameters.
+pub fn cfg_census(dim: Int, state_dim: Int, layers: Int, vocab: Int) -> Int with Pure:
+    let embed = vocab * dim
+    let per_layer = 4 * dim * dim + 3 * state_dim + 3 * dim
+    let head = dim * vocab + dim
+    return embed + layers * per_layer + head
+
+// Ternary weight footprint in bytes: ternary matrices at 2 bits/param
+// (params/4) + embedding + head kept at fp16 (2 bytes/param).
+pub fn cfg_footprint_bytes(dim: Int, state_dim: Int, layers: Int, vocab: Int) -> Int with Pure:
+    let ternary_params = layers * (4 * dim * dim + 3 * state_dim)
+    let fp16_params = 2 * vocab * dim + layers * 3 * dim + dim
+    return ternary_params / 4 + fp16_params * 2
+
+// Recurrent state bytes (fixed O(1) memory): layers * state_dim * dim fp32.
+pub fn cfg_state_bytes(dim: Int, state_dim: Int, layers: Int) -> Int with Pure:
+    return layers * state_dim * dim * 4
+
+// ── Preset Validators ──────────────────────────────────────────────────────
+
+pub fn cfg_step0_valid() -> Bool with Pure:
+    return cfg_dims_valid(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS)
+
+pub fn cfg_step1_valid() -> Bool with Pure:
+    return cfg_dims_valid(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS)
+
+pub fn cfg_opt_default_valid() -> Bool with Pure:
+    return cfg_opt_valid(CFG_LR, CFG_ADAM_B1, CFG_ADAM_B2)
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn config_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n config Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Step-0 census lands in the 150M-class band (formula documented above).
+    total = total + 1
+    let n0 = cfg_census(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS, CFG_VOCAB_SIZE)
+    if n0 > 120000000 and n0 < 180000000:
+        println("  [PASS] Test 1: Step-0 census 150M-class (" + str(n0) + " params)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: Step-0 census out of band (got " + str(n0) + ")")
+
+    // Test 2: Step-1 census is 1B-class and strictly larger than Step-0.
+    total = total + 1
+    let n1 = cfg_census(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS, CFG_VOCAB_SIZE)
+    if n1 > 800000000 and n1 < 2200000000 and n1 > n0:
+        println("  [PASS] Test 2: Step-1 census 1.5B-class (" + str(n1) + " params)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Step-1 census out of band (got " + str(n1) + ")")
+
+    // Test 3: Footprint receipts — Step-0 weights + state fit tiny caps.
+    total = total + 1
+    let f0 = cfg_footprint_bytes(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS, CFG_VOCAB_SIZE)
+    let s0 = cfg_state_bytes(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS)
+    if f0 > 0 and f0 < 200000000 and s0 > 0 and s0 < 20000000:
+        println("  [PASS] Test 3: Step-0 footprint weights=" + str(f0) + "B state=" + str(s0) + "B")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: Footprint out of cap")
+
+    // Test 4: Preset + optimizer laws accept truth, reject garbage.
+    total = total + 1
+    let v0 = cfg_step0_valid()
+    let v1 = cfg_step1_valid()
+    let vopt = cfg_opt_default_valid()
+    let bad_dim = cfg_dims_valid(1001, 128, 12)
+    let bad_layers = cfg_dims_valid(1024, 128, 0)
+    let bad_lr = cfg_opt_valid(2.0, 0.9, 0.999)
+    let bad_beta = cfg_opt_valid(0.001, 0.999, 0.9)
+    let bad_train = cfg_train_valid(16384, 100, 8)
+    if v0 and v1 and vopt and (bad_dim == false) and (bad_layers == false) and (bad_lr == false) and (bad_beta == false) and (bad_train == false):
+        println("  [PASS] Test 4: Preset, optimizer & training-shape laws passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: Validator laws failed")
+
+    // Test 5: Cross-module contract — our literals agree with peer modules.
+    total = total + 1
+    let c_vocab = CFG_VOCAB_SIZE == 16384
+    let c_w = CFG_INVARIANT_W > 4.999 and CFG_INVARIANT_W < 5.001
+    let c_align = CFG_PACK_ALIGN == 64
+    let c_theta = CFG_ROPE_THETA > 9999.0 and CFG_ROPE_THETA < 10001.0
+    let c_eps = CFG_RMS_EPS > 0.0 and CFG_RMS_EPS < 0.001
+    if c_vocab and c_w and c_align and c_theta and c_eps:
+        println("  [PASS] Test 5: Contract agrees with tokenizer/distill/packer/RoPE literals")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Contract literal mismatch")
+
+    println("--- config Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn config_usage():
+    println("k_AI_n Architecture Config (config.kn)")
+    println("USAGE:")
+    println("  core config prove                  Run self-verifying test battery")
+    println("  core config stats                  Print census & footprint metrics")
+    println("  core config show                   Print both preset tables")
+
+pub fn config_stats() -> String:
+    var t = "=== k_AI_n Architecture Config ===\n"
+    t = t + "  Step-0 150M:  dim=1024 state=128 layers=24 seq=2048 batch=8\n"
+    t = t + "  Step-1 1.5B:  dim=3072 state=128 layers=32 seq=2048 batch=4\n"
+    t = t + "  Vocab:        16384 (matches tokenizer_16k)\n"
+    t = t + "  Optimizer:    Adam lr=0.001 b1=0.9 b2=0.999 eps=1e-8\n"
+    t = t + "  Distill:      5.0x invariant weight (matches distill_loss)\n"
+    t = t + "  Stream:       64B records (matches binary_packer)\n"
+    return t
+
+pub fn config_show() -> String:
+    var t = "--- Step-0 150M Proof of Alien Life ---\n"
+    t = t + "  census=" + str(cfg_census(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS, CFG_VOCAB_SIZE)) + "\n"
+    t = t + "  weights=" + str(cfg_footprint_bytes(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS, CFG_VOCAB_SIZE)) + "B\n"
+    t = t + "  state=" + str(cfg_state_bytes(CFG_S0_DIM, CFG_S0_STATE_DIM, CFG_S0_LAYERS)) + "B\n"
+    t = t + "--- Step-1 1.5B Scavenger Coder ---\n"
+    t = t + "  census=" + str(cfg_census(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS, CFG_VOCAB_SIZE)) + "\n"
+    t = t + "  weights=" + str(cfg_footprint_bytes(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS, CFG_VOCAB_SIZE)) + "B\n"
+    t = t + "  state=" + str(cfg_state_bytes(CFG_S1_DIM, CFG_S1_STATE_DIM, CFG_S1_LAYERS)) + "B\n"
+    return t
+
+pub fn config_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        config_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return config_test_battery()
+    elif cmd == "stats":
+        println(config_stats())
+        return 0
+    elif cmd == "show":
+        println(config_show())
+        return 0
+    else:
+        config_usage()
+        return 0

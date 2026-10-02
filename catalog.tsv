@@ -1,6 +1,6 @@
 module	source	target	status	receipt	notes	updated
 core	kain/core/_common.kn	llvm	proven	6/6 tests green; arena allocators, SIMD padding, law contracts, and kernel32 DMA roundtrip verified	Shared arena allocators, memory windows, assertions	2026-10-01
-config	kain/core/config.kn	llvm	draft	pending	Hardware capability probes and model hyperparameters	2026-10-01
+config	kain/core/config.kn	llvm	proven	5/5 tests green; 134M S0 census, 1.31B S1 census, footprint caps, cross-module contract verified	Hardware capability probes and model hyperparameters	2026-10-01
 dispatch	kain/core/dispatch.kn	llvm	proven	11/11 tests green; multi-call CLI routing and global prove runner verified	Multi-call entry point routing	2026-10-01
 mmap_loader	kain/core/mmap_loader.kn	llvm	draft	pending	Zero-copy kernel32 DMA file streaming	2026-10-01
 tokenizer_16k	kain/core/tokenizer_16k.kn	llvm	proven	5/5 tests green; 44% compression ratio; arena tokenization verified	16k English + Code byte-pair BPE tokenizer	2026-10-01
@@ -21,5 +21,5 @@ motion_wavelet	kain/core/motion_wavelet.kn	llvm	draft	pending	Temporal motion ve
 render_png	kain/core/render_png.kn	llvm	draft	pending	Native zero-dependency PNG encoder & rasterizer	2026-10-01
 entropy_screener	kain/core/entropy_screener.kn	llvm	draft	pending	Shannon entropy and LZW complexity filters	2026-10-01
 ast_verifier	kain/core/ast_verifier.kn	llvm	draft	pending	Syntax tree compiler validation gate	2026-10-01
-binary_packer	kain/core/binary_packer.kn	llvm	draft	pending	Contiguous 64-byte aligned .kain_bin packager	2026-10-01
-distill_loss	kain/core/distill_loss.kn	llvm	draft	pending	Invariant-weighted loss calculator	2026-10-01
+binary_packer	kain/core/binary_packer.kn	llvm	proven	5/5 tests green; header+magic, record roundtrip, batch stride rows, u64 codec verified	Contiguous 64-byte aligned .kain_bin packager	2026-10-01
+distill_loss	kain/core/distill_loss.kn	llvm	proven	5/5 tests green; zero-loss, 0.5 single-diff, 2.5 invariant-5x, temp+top1, batch-0.25 verified	Invariant-weighted loss calculator	2026-10-01

@@ -1,0 +1,287 @@
+// ============================================================================
+//  k_AI_n :: distill_loss.kn — Invariant-Weighted Distillation Loss
+// ============================================================================
+//  Subsystem 6: Scavenger Refinery & Distillation (training forge)
+//  Architecture:
+//    - Teacher-student logit matching WITHOUT transcendentals (TinyBERT-style
+//      MSE on raw logits — no ln/exp needed, fully provable in integer-safe
+//      float arithmetic):
+//        L = mean_d( w[d] * (student[d] - teacher[d])^2 )
+//        w[d] = invariant_w (5.0x) if mask[d] == 1 (pointer/bounds/type token)
+//        w[d] = 1.0 otherwise.
+//    - Temperature scaling on raw logits: logits[d] /= temp (division only).
+//    - Batch mean + top-1 agreement tracker for forge telemetry.
+//    - THE forge glue after the forward pass:
+//        ssm_forward_step(y_student, ...) -> distil_mse_weighted(y_student,
+//          y_teacher, mask, ...) -> scalar loss -> weight update.
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common.kn symbols (arenas, bref/fref, DMA, Tensor*).
+//    - NEVER redefines gemm_158b.kn symbols (TERNARY_*, gemm_*, ternary_*).
+//    - NEVER redefines activations.kn symbols (ACT_*, act_*, rms_*, softmax_*).
+//    - NEVER redefines ssm_liquid.kn symbols (SSM_*, ssm_*).
+//    - All new symbols use DISTIL_ prefix or distil_ scope.
+//    - Own softmax-free formulation: zero cross-module calls, standalone check
+//      stays hermetic (same discipline as ssm_liquid's local sigmoid copy).
+// ============================================================================
+
+use std::runtime
+
+// ── Distillation Constants (DISTIL_ scoped, no collisions) ───────────────────
+
+pub const DISTIL_INVARIANT_W: Float = 5.0
+pub const DISTIL_TEMP_DEFAULT: Float = 1.0
+pub const DISTIL_LOSS_CEIL: Float = 1000000.0
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law distil_dims_valid(dim: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0
+
+pub law distil_temp_valid(temp: Float) -> Bool:
+    return temp > 0.0 and temp <= 100.0
+
+pub law distil_weight_valid(w: Float) -> Bool:
+    return w >= 1.0 and w <= 100.0
+
+// ── Converge Block: Weighted Squared Error (spec vs fast lane) ──────────────
+
+pub converge distil_weighted_sq(diff: Float, w: Float) -> Float:
+    spec reference:
+        return w * diff * diff
+    fast fast_lane when capability("cpu.x86.avx2"):
+        return w * diff * diff
+    verify random(8)
+
+// ── Core Kernels ────────────────────────────────────────────────────────────
+
+// Temperature scaling on raw logits: logits[d] /= temp. IN-PLACE.
+pub fn distil_temp_scale_inplace(logits: ptr<Float>, dim: Int, temp: Float) -> Int with Unsafe:
+    let inv = 1.0 / temp
+    var i = 0
+    while i < dim:
+        let v = mem_load(ptr_offset(logits, i, "Float"), "Float") as Float
+        mem_store(ptr_offset(logits, i, "Float"), v * inv, "Float")
+        i = i + 1
+    return 0
+
+// Weighted MSE over one position: mean_d( w[d] * (s[d]-t[d])^2 ).
+// mask[d] != 0 selects invariant_w (5x on pointers/bounds/types), else 1.0.
+pub fn distil_mse_weighted(student: ptr<Float>, teacher: ptr<Float>, mask: ptr<Byte>, dim: Int, invariant_w: Float) -> Float with Unsafe:
+    var acc: Float = 0.0
+    var i = 0
+    while i < dim:
+        let s = mem_load(ptr_offset(student, i, "Float"), "Float") as Float
+        let t = mem_load(ptr_offset(teacher, i, "Float"), "Float") as Float
+        let m = mem_load(ptr_offset(mask, i, "Byte"), "Int") & 255
+        var w: Float = 1.0
+        if m != 0:
+            w = invariant_w
+        let diff = s - t
+        acc = acc + distil_weighted_sq(diff, w)
+        i = i + 1
+    let loss = acc / (dim as Float)
+    if loss > DISTIL_LOSS_CEIL:
+        return DISTIL_LOSS_CEIL
+    return loss
+
+// Batch mean over N positions (contiguous batch x dim row-major logits).
+pub fn distil_loss_batch(student_b: ptr<Float>, teacher_b: ptr<Float>, mask_b: ptr<Byte>, batch: Int, dim: Int, invariant_w: Float) -> Float with Unsafe:
+    var acc: Float = 0.0
+    var b = 0
+    while b < batch:
+        let s_row = ptr_offset(student_b, b * dim, "Float")
+        let t_row = ptr_offset(teacher_b, b * dim, "Float")
+        let m_row = ptr_offset(mask_b, b * dim, "Byte")
+        acc = acc + distil_mse_weighted(s_row, t_row, m_row, dim, invariant_w)
+        b = b + 1
+    return acc / (batch as Float)
+
+// Top-1 agreement: 1 if student argmax == teacher argmax, else 0.
+pub fn distil_top1_match(student: ptr<Float>, teacher: ptr<Float>, dim: Int) -> Int with Unsafe:
+    var best_s = 0
+    var best_sv = mem_load(ptr_offset(student, 0, "Float"), "Float") as Float
+    var i = 1
+    while i < dim:
+        let v = mem_load(ptr_offset(student, i, "Float"), "Float") as Float
+        if v > best_sv:
+            best_sv = v
+            best_s = i
+        i = i + 1
+    var best_t = 0
+    var best_tv = mem_load(ptr_offset(teacher, 0, "Float"), "Float") as Float
+    var j = 1
+    while j < dim:
+        let w = mem_load(ptr_offset(teacher, j, "Float"), "Float") as Float
+        if w > best_tv:
+            best_tv = w
+            best_t = j
+        j = j + 1
+    if best_s == best_t:
+        return 1
+    return 0
+
+// Count invariant-marked positions in a mask row.
+pub fn distil_count_invariant(mask: ptr<Byte>, dim: Int) -> Int with Unsafe:
+    var n = 0
+    var i = 0
+    while i < dim:
+        let m = mem_load(ptr_offset(mask, i, "Byte"), "Int") & 255
+        if m != 0:
+            n = n + 1
+        i = i + 1
+    return n
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn distill_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n distill_loss Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Identical logits -> loss exactly 0.0.
+    total = total + 1
+    let dim1 = 8
+    let s1: ptr<Float> = alloc_zeroed(64, "Float")
+    let t1: ptr<Float> = alloc_zeroed(64, "Float")
+    let m1: ptr<Byte> = alloc_zeroed(64, "Byte")
+    var f1 = 0
+    while f1 < dim1:
+        mem_store(ptr_offset(s1, f1, "Float"), (f1 as Float) * 0.5, "Float")
+        mem_store(ptr_offset(t1, f1, "Float"), (f1 as Float) * 0.5, "Float")
+        f1 = f1 + 1
+    let loss1 = distil_mse_weighted(s1, t1, m1, dim1, DISTIL_INVARIANT_W)
+    decay s1
+    decay t1
+    decay m1
+    if loss1 > -0.0001 and loss1 < 0.0001:
+        println("  [PASS] Test 1: Identical logits yield zero loss")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: Expected 0.0, got " + str(loss1))
+
+    // Test 2: Single diff of 2.0 in dim 8, no mask -> 4.0/8 = 0.5.
+    total = total + 1
+    let dim2 = 8
+    let s2: ptr<Float> = alloc_zeroed(64, "Float")
+    let t2: ptr<Float> = alloc_zeroed(64, "Float")
+    let m2: ptr<Byte> = alloc_zeroed(64, "Byte")
+    mem_store(ptr_offset(s2, 3, "Float"), 2.0 as Float, "Float")
+    let loss2 = distil_mse_weighted(s2, t2, m2, dim2, DISTIL_INVARIANT_W)
+    decay s2
+    decay t2
+    decay m2
+    if loss2 > 0.4999 and loss2 < 0.5001:
+        println("  [PASS] Test 2: Single-position diff loss verified (0.5)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Expected 0.5, got " + str(loss2))
+
+    // Test 3: Same diff with invariant mask -> 5*4/8 = 2.5 (exactly 5x Test 2).
+    total = total + 1
+    let dim3 = 8
+    let s3: ptr<Float> = alloc_zeroed(64, "Float")
+    let t3: ptr<Float> = alloc_zeroed(64, "Float")
+    let m3: ptr<Byte> = alloc_zeroed(64, "Byte")
+    mem_store(ptr_offset(s3, 3, "Float"), 2.0 as Float, "Float")
+    mem_store(ptr_offset(m3, 3, "Byte"), 1 as Byte, "Byte")
+    let loss3 = distil_mse_weighted(s3, t3, m3, dim3, DISTIL_INVARIANT_W)
+    let ninv = distil_count_invariant(m3, dim3)
+    decay s3
+    decay t3
+    decay m3
+    if loss3 > 2.4999 and loss3 < 2.5001 and ninv == 1:
+        println("  [PASS] Test 3: Invariant 5x weighting verified (2.5 = 5x 0.5)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: Expected 2.5, got " + str(loss3))
+
+    // Test 4: Temp scaling halves logits at T=2 + top-1 agreement both ways.
+    total = total + 1
+    let dim4 = 8
+    let l4: ptr<Float> = alloc_zeroed(64, "Float")
+    let sa: ptr<Float> = alloc_zeroed(64, "Float")
+    let ta: ptr<Float> = alloc_zeroed(64, "Float")
+    let sb: ptr<Float> = alloc_zeroed(64, "Float")
+    let tb: ptr<Float> = alloc_zeroed(64, "Float")
+    mem_store(ptr_offset(l4, 0, "Float"), 2.0 as Float, "Float")
+    mem_store(ptr_offset(l4, 1, "Float"), 4.0 as Float, "Float")
+    distil_temp_scale_inplace(l4, dim4, 2.0)
+    let c0 = mem_load(ptr_offset(l4, 0, "Float"), "Float") as Float
+    let c1 = mem_load(ptr_offset(l4, 1, "Float"), "Float") as Float
+    mem_store(ptr_offset(sa, 5, "Float"), 9.0 as Float, "Float")
+    mem_store(ptr_offset(ta, 5, "Float"), 7.0 as Float, "Float")
+    mem_store(ptr_offset(sb, 2, "Float"), 9.0 as Float, "Float")
+    mem_store(ptr_offset(tb, 6, "Float"), 9.0 as Float, "Float")
+    let agree = distil_top1_match(sa, ta, dim4)
+    let disagree = distil_top1_match(sb, tb, dim4)
+    decay l4
+    decay sa
+    decay ta
+    decay sb
+    decay tb
+    if c0 > 0.999 and c0 < 1.001 and c1 > 1.999 and c1 < 2.001 and agree == 1 and disagree == 0:
+        println("  [PASS] Test 4: Temp scaling + top-1 agree/disagree verified")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: Temp/top1 mismatch")
+
+    // Test 5: Batch mean over 2 rows (0.0 and 0.5) -> 0.25 + invariant laws.
+    total = total + 1
+    let dim5 = 8
+    let batch5 = 2
+    let sb5: ptr<Float> = alloc_zeroed(128, "Float")
+    let tb5: ptr<Float> = alloc_zeroed(128, "Float")
+    let mb5: ptr<Byte> = alloc_zeroed(128, "Byte")
+    mem_store(ptr_offset(sb5, 8 + 3, "Float"), 2.0 as Float, "Float")
+    let bloss = distil_loss_batch(sb5, tb5, mb5, batch5, dim5, DISTIL_INVARIANT_W)
+    let l1 = distil_dims_valid(64)
+    let l2 = distil_dims_valid(63)
+    let l3 = distil_temp_valid(1.0)
+    let l4ok = distil_temp_valid(0.0)
+    let l5 = distil_weight_valid(5.0)
+    let l6 = distil_weight_valid(0.5)
+    decay sb5
+    decay tb5
+    decay mb5
+    if bloss > 0.2499 and bloss < 0.2501 and l1 and (l2 == false) and l3 and (l4ok == false) and l5 and (l6 == false):
+        println("  [PASS] Test 5: Batch mean (0.25) + dimension/temp/weight laws passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Batch/laws mismatch (got " + str(bloss) + ")")
+
+    println("--- distill_loss Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn distill_usage():
+    println("k_AI_n Invariant-Weighted Distillation Loss (distill_loss.kn)")
+    println("USAGE:")
+    println("  core distill prove                 Run self-verifying test battery")
+    println("  core distill stats                 Print loss/weighting metrics")
+
+pub fn distill_stats() -> String:
+    var t = "=== k_AI_n Invariant-Weighted Distillation Loss ===\n"
+    t = t + "  Loss:         Weighted MSE on teacher logits (no ln/exp needed)\n"
+    t = t + "  Weighting:    5.0x on invariant tokens (pointers/bounds/types)\n"
+    t = t + "  Temperature:  Division-only logit scaling (T in (0, 100])\n"
+    t = t + "  Telemetry:    Batch mean loss + top-1 agreement tracker\n"
+    t = t + "  Allocations:  0 (reads arena rows in place, returns scalar)\n"
+    return t
+
+pub fn distill_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        distill_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return distill_test_battery()
+    elif cmd == "stats":
+        println(distill_stats())
+        return 0
+    else:
+        distill_usage()
+        return 0

@@ -1,0 +1,355 @@
+// ============================================================================
+//  k_AI_n :: binary_packer.kn — Contiguous 64-Byte Aligned .kain_bin Packager
+// ============================================================================
+//  Subsystem 6: Scavenger Refinery & Distillation (training forge feed)
+//  Architecture:
+//    - The `.kain_bin` training stream: ONE contiguous arena, 64-byte aligned
+//      records, laid out for zero-copy DMA into the forge:
+//        bytes 0..7:    magic "KAINBIN1" (75,65,73,78,66,73,78,49)
+//        bytes 8..15:   version u64 LE (=1)
+//        bytes 16..23:  dim (sequence length) u64 LE
+//        bytes 24..31:  count (number of sequences) u64 LE
+//        per record:    dim token u16 LE (dim*2 bytes, fits 16k vocab)
+//                       + dim mask bytes (1 = invariant pointer/bounds/type)
+//                       + zero padding up to 64-byte multiple
+//        record stride = round64(dim * 3)
+//    - THE forge-feed glue (buffer contract, no serialization):
+//        tokenizer tokenize_into_arena(text) -> token IDs
+//        bin_pack_record(buf, ...)          -> contiguous .kain_bin arena
+//        _common dma_write_file(path, buf)  -> train.kain_bin on disk (77x DMA,
+//                                             proven 6/6 in _common.kn)
+//        _common dma_read_file(path)        -> arena back in RAM
+//        bin_unpack_record(...)             -> rows for distil_loss_batch
+//      Packer owns LAYOUT ONLY; _common owns BYTES-ON-DISK. Zero overlap.
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common.kn symbols (arenas, bref/bstore, DMA, Tensor*).
+//    - NEVER redefines gemm/activations/ssm/distill symbols.
+//    - All new symbols use BIN_ prefix or bin_ scope.
+//    - Leaf-module discipline: raw mem_load/mem_store/ptr_offset builtins only
+//      (same as gemm_158b's packed-2b codec) so standalone check stays hermetic.
+// ============================================================================
+
+use std::runtime
+
+// ── Format Constants (BIN_ scoped, no collisions) ───────────────────────────
+
+pub const BIN_VERSION: Int = 1
+pub const BIN_ALIGN: Int = 64
+pub const BIN_HEADER_LEN: Int = 32
+pub const BIN_M0: Int = 75
+pub const BIN_M1: Int = 65
+pub const BIN_M2: Int = 73
+pub const BIN_M3: Int = 78
+pub const BIN_M4: Int = 66
+pub const BIN_M5: Int = 73
+pub const BIN_M6: Int = 78
+pub const BIN_M7: Int = 49
+pub const BIN_VOCAB_MAX: Int = 16383
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law bin_dims_valid(dim: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0
+
+pub law bin_count_valid(n: Int) -> Bool:
+    return n > 0 and n <= 1000000
+
+pub law bin_stride_aligned(stride: Int) -> Bool:
+    return stride > 0 and (stride % 64) == 0
+
+// ── Layout Arithmetic ───────────────────────────────────────────────────────
+
+// Record stride: dim u16 tokens + dim mask bytes, rounded up to 64.
+pub fn bin_record_stride(dim: Int) -> Int with Pure:
+    let raw = dim * 3
+    return ((raw + BIN_ALIGN - 1) / BIN_ALIGN) * BIN_ALIGN
+
+// Total stream bytes for count sequences of dim tokens.
+pub fn bin_stream_bytes(dim: Int, count: Int) -> Int with Pure:
+    return BIN_HEADER_LEN + count * bin_record_stride(dim)
+
+// ── Little-Endian u64 Codec (header fields) ─────────────────────────────────
+
+pub fn bin_write_u64(buf: ptr<Byte>, off: Int, v: Int) -> Int with Unsafe:
+    var shift = 0
+    var i = 0
+    while i < 8:
+        let byte_v = (v >> shift) & 255
+        mem_store(ptr_offset(buf, off + i, "Byte"), byte_v as Byte, "Byte")
+        shift = shift + 8
+        i = i + 1
+    return 0
+
+pub fn bin_read_u64(buf: ptr<Byte>, off: Int) -> Int with Unsafe:
+    var acc = 0
+    var shift = 0
+    var i = 0
+    while i < 8:
+        let byte_v = mem_load(ptr_offset(buf, off + i, "Byte"), "Int") & 255
+        acc = acc + (byte_v << shift)
+        shift = shift + 8
+        i = i + 1
+    return acc
+
+// ── Header Write / Validate ─────────────────────────────────────────────────
+
+pub fn bin_write_header(buf: ptr<Byte>, dim: Int, count: Int) -> Int with Unsafe:
+    mem_store(ptr_offset(buf, 0, "Byte"), BIN_M0 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 1, "Byte"), BIN_M1 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 2, "Byte"), BIN_M2 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 3, "Byte"), BIN_M3 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 4, "Byte"), BIN_M4 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 5, "Byte"), BIN_M5 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 6, "Byte"), BIN_M6 as Byte, "Byte")
+    mem_store(ptr_offset(buf, 7, "Byte"), BIN_M7 as Byte, "Byte")
+    bin_write_u64(buf, 8, BIN_VERSION)
+    bin_write_u64(buf, 16, dim)
+    bin_write_u64(buf, 24, count)
+    return 0
+
+// Returns 0 if valid (writes dim/count out), else error code:
+// 1 = bad magic, 2 = bad version, 3 = buffer too small for claimed shape.
+pub fn bin_validate_header(buf: ptr<Byte>, nbytes: Int, out_dim: ptr<Int>, out_count: ptr<Int>) -> Int with Unsafe:
+    if (mem_load(ptr_offset(buf, 0, "Byte"), "Int") & 255) != BIN_M0:
+        return 1
+    if (mem_load(ptr_offset(buf, 1, "Byte"), "Int") & 255) != BIN_M1:
+        return 1
+    if (mem_load(ptr_offset(buf, 2, "Byte"), "Int") & 255) != BIN_M2:
+        return 1
+    if (mem_load(ptr_offset(buf, 3, "Byte"), "Int") & 255) != BIN_M3:
+        return 1
+    if (mem_load(ptr_offset(buf, 4, "Byte"), "Int") & 255) != BIN_M4:
+        return 1
+    if (mem_load(ptr_offset(buf, 5, "Byte"), "Int") & 255) != BIN_M5:
+        return 1
+    if (mem_load(ptr_offset(buf, 6, "Byte"), "Int") & 255) != BIN_M6:
+        return 1
+    if (mem_load(ptr_offset(buf, 7, "Byte"), "Int") & 255) != BIN_M7:
+        return 1
+    let ver = bin_read_u64(buf, 8)
+    if ver != BIN_VERSION:
+        return 2
+    let dim = bin_read_u64(buf, 16)
+    let count = bin_read_u64(buf, 24)
+    if bin_stream_bytes(dim, count) > nbytes:
+        return 3
+    mem_store(out_dim, dim, "Int")
+    mem_store(out_count, count, "Int")
+    return 0
+
+// ── Record Pack / Unpack (u16 tokens + mask bytes, zero-padded to stride) ───
+
+pub fn bin_pack_record(buf: ptr<Byte>, base: Int, tokens: ptr<Int>, mask: ptr<Byte>, dim: Int) -> Int with Unsafe:
+    let tok_base = base
+    let msk_base = base + dim * 2
+    var i = 0
+    while i < dim:
+        let tok = mem_load(ptr_offset(tokens, i, "Int"), "Int")
+        let t_lo = tok_base + i * 2
+        mem_store(ptr_offset(buf, t_lo, "Byte"), (tok & 255) as Byte, "Byte")
+        let t_hi = tok_base + i * 2 + 1
+        mem_store(ptr_offset(buf, t_hi, "Byte"), ((tok >> 8) & 255) as Byte, "Byte")
+        i = i + 1
+    var j = 0
+    while j < dim:
+        let m_at = msk_base + j
+        let msrc = mem_load(ptr_offset(mask, j, "Byte"), "Int") & 255
+        mem_store(ptr_offset(buf, m_at, "Byte"), msrc as Byte, "Byte")
+        j = j + 1
+    let stride = bin_record_stride(dim)
+    let pad_end = base + stride
+    var p = base + dim * 3
+    while p < pad_end:
+        mem_store(ptr_offset(buf, p, "Byte"), 0 as Byte, "Byte")
+        p = p + 1
+    return 0
+
+pub fn bin_unpack_record(tokens_out: ptr<Int>, mask_out: ptr<Byte>, buf: ptr<Byte>, base: Int, dim: Int) -> Int with Unsafe:
+    let tok_base = base
+    let msk_base = base + dim * 2
+    var i = 0
+    while i < dim:
+        let t_lo = tok_base + i * 2
+        let lo = mem_load(ptr_offset(buf, t_lo, "Byte"), "Int") & 255
+        let t_hi = tok_base + i * 2 + 1
+        let hi = mem_load(ptr_offset(buf, t_hi, "Byte"), "Int") & 255
+        mem_store(ptr_offset(tokens_out, i, "Int"), lo + hi * 256, "Int")
+        let m_at = msk_base + i
+        mem_store(ptr_offset(mask_out, i, "Byte"), (mem_load(ptr_offset(buf, m_at, "Byte"), "Int") & 255) as Byte, "Byte")
+        i = i + 1
+    return 0
+
+// Pack a full batch: row b lives at header + b * stride (row-major for distill).
+pub fn bin_pack_batch(buf: ptr<Byte>, tokens_b: ptr<Int>, mask_b: ptr<Byte>, batch: Int, dim: Int) -> Int with Unsafe:
+    bin_write_header(buf, dim, batch)
+    let stride = bin_record_stride(dim)
+    var b = 0
+    while b < batch:
+        let base = BIN_HEADER_LEN + b * stride
+        let t_row = ptr_offset(tokens_b, b * dim, "Int")
+        let m_row = ptr_offset(mask_b, b * dim, "Byte")
+        bin_pack_record(buf, base, t_row, m_row, dim)
+        b = b + 1
+    return 0
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn binpack_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n binary_packer Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Header write + validate roundtrip; corrupted magic rejected.
+    total = total + 1
+    let dim1 = 8
+    let cnt1 = 2
+    let nb1 = bin_stream_bytes(dim1, cnt1)
+    let buf1: ptr<Byte> = alloc_zeroed(256, "Byte")
+    bin_write_header(buf1, dim1, cnt1)
+    let od1: ptr<Int> = alloc_zeroed(8, "Int")
+    let oc1: ptr<Int> = alloc_zeroed(8, "Int")
+    let rc_ok = bin_validate_header(buf1, nb1, od1, oc1)
+    let got_dim = mem_load(od1, "Int")
+    let got_cnt = mem_load(oc1, "Int")
+    mem_store(ptr_offset(buf1, 0, "Byte"), 0 as Byte, "Byte")
+    let rc_bad = bin_validate_header(buf1, nb1, od1, oc1)
+    decay buf1
+    decay od1
+    decay oc1
+    if rc_ok == 0 and got_dim == dim1 and got_cnt == cnt1 and rc_bad == 1:
+        println("  [PASS] Test 1: Header roundtrip valid, corrupted magic rejected")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: Header mismatch")
+
+    // Test 2: Record pack/unpack roundtrip incl. edge token values.
+    total = total + 1
+    let dim2 = 8
+    let stride2 = bin_record_stride(dim2)
+    let buf2: ptr<Byte> = alloc_zeroed(256, "Byte")
+    let tok2: ptr<Int> = alloc_zeroed(64, "Int")
+    let msk2: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let tok2b: ptr<Int> = alloc_zeroed(64, "Int")
+    let msk2b: ptr<Byte> = alloc_zeroed(64, "Byte")
+    mem_store(ptr_offset(tok2, 0, "Int"), 0, "Int")
+    mem_store(ptr_offset(tok2, 1, "Int"), 16383, "Int")
+    mem_store(ptr_offset(tok2, 2, "Int"), 255, "Int")
+    mem_store(ptr_offset(tok2, 3, "Int"), 256, "Int")
+    mem_store(ptr_offset(tok2, 4, "Int"), 334, "Int")
+    mem_store(ptr_offset(msk2, 1, "Byte"), 1 as Byte, "Byte")
+    mem_store(ptr_offset(msk2, 4, "Byte"), 1 as Byte, "Byte")
+    bin_pack_record(buf2, 0, tok2, msk2, dim2)
+    bin_unpack_record(tok2b, msk2b, buf2, 0, dim2)
+    let r1 = mem_load(ptr_offset(tok2b, 1, "Int"), "Int")
+    let r4 = mem_load(ptr_offset(tok2b, 4, "Int"), "Int")
+    let r0 = mem_load(ptr_offset(tok2b, 0, "Int"), "Int")
+    let rm1 = mem_load(ptr_offset(msk2b, 1, "Byte"), "Int") & 255
+    let rm0 = mem_load(ptr_offset(msk2b, 0, "Byte"), "Int") & 255
+    decay buf2
+    decay tok2
+    decay msk2
+    decay tok2b
+    decay msk2b
+    if r1 == 16383 and r4 == 334 and r0 == 0 and rm1 == 1 and rm0 == 0 and stride2 == 64:
+        println("  [PASS] Test 2: Record roundtrip exact (edge tokens + mask, stride 64)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Record mismatch")
+
+    // Test 3: Batch pack — row 1 lands at header + stride, header validates.
+    total = total + 1
+    let dim3 = 8
+    let batch3 = 2
+    let stride3 = bin_record_stride(dim3)
+    let nb3 = bin_stream_bytes(dim3, batch3)
+    let buf3: ptr<Byte> = alloc_zeroed(256, "Byte")
+    let tok3: ptr<Int> = alloc_zeroed(64, "Int")
+    let msk3: ptr<Byte> = alloc_zeroed(64, "Byte")
+    mem_store(ptr_offset(tok3, 8 + 0, "Int"), 7777, "Int")
+    mem_store(ptr_offset(msk3, 8 + 0, "Byte"), 1 as Byte, "Byte")
+    bin_pack_batch(buf3, tok3, msk3, batch3, dim3)
+    let od3: ptr<Int> = alloc_zeroed(8, "Int")
+    let oc3: ptr<Int> = alloc_zeroed(8, "Int")
+    let rc3 = bin_validate_header(buf3, nb3, od3, oc3)
+    let row1base = BIN_HEADER_LEN + stride3
+    let r1lo = mem_load(ptr_offset(buf3, row1base, "Byte"), "Int") & 255
+    let r1hi = mem_load(ptr_offset(buf3, row1base + 1, "Byte"), "Int") & 255
+    let r1tok = r1lo + r1hi * 256
+    let r1m = mem_load(ptr_offset(buf3, row1base + dim3 * 2, "Byte"), "Int") & 255
+    let r0lo = mem_load(ptr_offset(buf3, BIN_HEADER_LEN, "Byte"), "Int") & 255
+    decay buf3
+    decay tok3
+    decay msk3
+    decay od3
+    decay oc3
+    if rc3 == 0 and r1tok == 7777 and r1m == 1 and r0lo == 0 and nb3 == 32 + 2 * 64:
+        println("  [PASS] Test 3: Batch rows land on stride boundaries, header validates")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: Batch layout mismatch")
+
+    // Test 4: u64 codec roundtrip on large dim/count values.
+    total = total + 1
+    let buf4: ptr<Byte> = alloc_zeroed(64, "Byte")
+    bin_write_u64(buf4, 0, 8192)
+    bin_write_u64(buf4, 8, 50000)
+    let v0 = bin_read_u64(buf4, 0)
+    let v1 = bin_read_u64(buf4, 8)
+    decay buf4
+    if v0 == 8192 and v1 == 50000:
+        println("  [PASS] Test 4: u64 LE codec roundtrip verified (8192, 50000)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: u64 codec mismatch")
+
+    // Test 5: Invariant laws (dims, count, stride alignment).
+    total = total + 1
+    let l1 = bin_dims_valid(64)
+    let l2 = bin_dims_valid(63)
+    let l3 = bin_count_valid(1000)
+    let l4 = bin_count_valid(0)
+    let l5 = bin_stride_aligned(bin_record_stride(8))
+    let l6 = bin_stride_aligned(63)
+    if l1 and (l2 == false) and l3 and (l4 == false) and l5 and (l6 == false):
+        println("  [PASS] Test 5: Packer dimension, count & alignment laws passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Invariant laws failed")
+
+    println("--- binary_packer Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn binpack_usage():
+    println("k_AI_n .kain_bin Packager (binary_packer.kn)")
+    println("USAGE:")
+    println("  core pack prove                    Run self-verifying test battery")
+    println("  core pack stats                    Print stream format & stride metrics")
+
+pub fn binpack_stats() -> String:
+    var t = "=== k_AI_n .kain_bin Training Stream ===\n"
+    t = t + "  Header:       32B magic KAINBIN1 + version/dim/count u64 LE\n"
+    t = t + "  Record:       dim u16 tokens + dim mask bytes, padded to 64B\n"
+    t = t + "  Stride(dim8): 64B (dim*3=24, rounded to 64 for cache lines)\n"
+    t = t + "  Vocab:        u16 tokens cover full 16k range (0..16383)\n"
+    t = t + "  Persistence:  arena -> dma_write_file -> train.kain_bin (77x DMA)\n"
+    t = t + "  Allocations:  0 in hot path (caller-owned arenas, in-place codec)\n"
+    return t
+
+pub fn binpack_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        binpack_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return binpack_test_battery()
+    elif cmd == "stats":
+        println(binpack_stats())
+        return 0
+    else:
+        binpack_usage()
+        return 0
