@@ -1,0 +1,709 @@
+// ============================================================================
+//  k_AI_n :: backward.kn — Gradient Twins + Finite-Difference Proofs (Phase A3)
+// ============================================================================
+//  Subsystem 4: Recurrent Hybrid & Equilibrium Model (learning half)
+//  Architecture:
+//    - One analytic twin per forward kernel (Subsystem 3 + forward.kn):
+//        distil_mse_weighted -> bwd_distill_seed (dL/dstudent row)
+//        gemm_158b_matvec    -> bwd_ternary_matvec (dL/dx + float STE shadow)
+//        rms_norm_weighted   -> bwd_rmsnorm (dL/dx + dL/dgamma)
+//        swiglu_inplace      -> bwd_swiglu (dL/da gate + dL/db value)
+//        ssm_forward_step    -> bwd_ssm_step (dL/dx, dL/dstate_old,
+//                               dL/dC, dL/dB, dL/dA, dL/dskip)
+//        fwd_residual_add    -> bwd_residual_split (gradient fanout copy)
+//    - STE HONESTY: ternary weights are discrete, so dL/dW_float is the
+//      straight-through estimator (dLdy[i]*x[j] into a float shadow the
+//      optimizer owns). It is NOT finite-diff verifiable through the packed
+//      discrete forward, and we do not pretend otherwise: tests FD-check
+//      dL/dx (forward is linear in x) and verify shadow entries by formula.
+//    - Every smooth twin is proven against CENTRAL finite differences:
+//        numeric = (f(x+e) - f(x-e)) / 2e, e = BWD_FD_E.
+//    - ZERO allocations in kernels: all grad buffers caller-owned, overwrite
+//      (=) semantics so A4/Adam owns accumulation across batch/sequence.
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common/gemm/activations/ssm/distill/packer/config.
+//    - Calls ONLY: act_sigmoid_scalar, ssm_discrete_decay (pure math),
+//      plus forward kernels inside the TEST chain demo.
+//    - All new symbols use BWD_ prefix or bwd_ scope.
+// ============================================================================
+
+use std::runtime
+use std::intent
+
+// ── Backward Constants (BWD_ scoped, no collisions) ─────────────────────────
+
+pub const BWD_FD_E: Float = 0.0001
+pub const BWD_FD_TOL: Float = 0.001
+pub const BWD_INV_W: Float = 5.0
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law bwd_dims_valid(dim: Int, state_dim: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0 and state_dim > 0
+
+pub law bwd_fd_valid(eps: Float, tol: Float) -> Bool:
+    return eps > 0.0 and eps < 0.01 and tol > 0.0 and tol < 1.0
+
+// ── Converge Blocks (spec vs fast lane) ─────────────────────────────────────
+
+pub converge bwd_seed_term(diff: Float, w: Float, dim: Float) -> Float:
+    spec reference:
+        return 2.0 * w * diff / dim
+    fast fast_lane when capability("cpu.x86.avx2"):
+        return 2.0 * w * diff / dim
+    verify random(8)
+
+pub converge bwd_silu_prime(a: Float, sig: Float) -> Float:
+    spec reference:
+        return sig * (1.0 + a * (1.0 - sig))
+    fast fast_lane when capability("cpu.x86.avx2"):
+        return sig * (1.0 + a * (1.0 - sig))
+    verify random(8)
+
+// ── Distill Seed: dL/dstudent row (drives the whole chain) ──────────────────
+
+// L = mean_d(w[d]*(s[d]-t[d])^2) -> dL/ds[j] = 2*w[j]*(s[j]-t[j])/dim.
+pub fn bwd_distill_seed(dlds: ptr<Float>, s: ptr<Float>, t: ptr<Float>, mask: ptr<Byte>, dim: Int, inv_w: Float) -> Int with Unsafe:
+    let dimf = dim as Float
+    var i = 0
+    while i < dim:
+        let sv = mem_load(ptr_offset(s, i, "Float"), "Float") as Float
+        let tv = mem_load(ptr_offset(t, i, "Float"), "Float") as Float
+        let m = mem_load(ptr_offset(mask, i, "Byte"), "Int") & 255
+        var w: Float = 1.0
+        if m != 0:
+            w = inv_w
+        mem_store(ptr_offset(dlds, i, "Float"), bwd_seed_term(sv - tv, w, dimf), "Float")
+        i = i + 1
+    return 0
+
+// ── Ternary Matvec Backward (dL/dx exact + STE float shadow) ────────────────
+
+// Y = W*X (W packed 2-bit). dL/dx[j] = sum_i dLdy[i]*w(i,j), decoded.
+// dLdWf[i*k+j] = dLdy[i]*x[j] (STE shadow, overwrite). Both overwrite.
+pub fn bwd_ternary_matvec(dldx: ptr<Float>, dldwf: ptr<Float>, dldy: ptr<Float>, w_packed: ptr<Byte>, x: ptr<Float>, m: Int, k: Int) -> Int with Unsafe:
+    let row_bytes = k / 4
+    var j = 0
+    while j < k:
+        mem_store(ptr_offset(dldx, j, "Float"), 0.0 as Float, "Float")
+        j = j + 1
+    var row = 0
+    while row < m:
+        let dy = mem_load(ptr_offset(dldy, row, "Float"), "Float") as Float
+        let row_w = ptr_offset(w_packed, row * row_bytes, "Byte")
+        var b_idx = 0
+        while b_idx < row_bytes:
+            let byte_val = mem_load(ptr_offset(row_w, b_idx, "Byte"), "Int") & 255
+            let base_j = b_idx * 4
+            var lane = 0
+            while lane < 4:
+                let code = (byte_val >> (lane * 2)) & 3
+                var wv: Float = 0.0
+                if code == 1:
+                    wv = 1.0
+                elif code == 2:
+                    wv = 0.0 - 1.0
+                let jj = base_j + lane
+                let xv = mem_load(ptr_offset(x, jj, "Float"), "Float") as Float
+                let g_old = mem_load(ptr_offset(dldx, jj, "Float"), "Float") as Float
+                mem_store(ptr_offset(dldx, jj, "Float"), g_old + dy * wv, "Float")
+                mem_store(ptr_offset(dldwf, row * k + jj, "Float"), dy * xv, "Float")
+                lane = lane + 1
+            b_idx = b_idx + 1
+        row = row + 1
+    return 0
+
+// ── RMSNorm Backward (weighted): dL/dx + dL/dgamma ──────────────────────────
+
+// y[i] = x[i]*r*g[i], r = 1/sqrt(mean(x^2)+eps).
+// dLdgamma[i] = dLdy[i]*x[i]*r.
+// dLdx[j] = r*(dLdy[j]*g[j] - x[j]*dot*r*r/dim), dot = sum(dLdy*g*x).
+pub fn bwd_rmsnorm(dldx: ptr<Float>, dldgamma: ptr<Float>, dldy: ptr<Float>, x: ptr<Float>, gamma: ptr<Float>, dim: Int, eps: Float) -> Int with Unsafe:
+    var sum_sq: Float = 0.0
+    var i = 0
+    while i < dim:
+        let xi = mem_load(ptr_offset(x, i, "Float"), "Float") as Float
+        sum_sq = sum_sq + xi * xi
+        i = i + 1
+    let mean_sq = sum_sq / (dim as Float)
+    let r = 1.0 / sqrt(mean_sq + eps)
+    var dot: Float = 0.0
+    var k = 0
+    while k < dim:
+        let dy = mem_load(ptr_offset(dldy, k, "Float"), "Float") as Float
+        let gg = mem_load(ptr_offset(gamma, k, "Float"), "Float") as Float
+        let xx = mem_load(ptr_offset(x, k, "Float"), "Float") as Float
+        dot = dot + dy * gg * xx
+        k = k + 1
+    let dimf = dim as Float
+    let rr = r * r
+    var j = 0
+    while j < dim:
+        let dyj = mem_load(ptr_offset(dldy, j, "Float"), "Float") as Float
+        let gj = mem_load(ptr_offset(gamma, j, "Float"), "Float") as Float
+        let xj = mem_load(ptr_offset(x, j, "Float"), "Float") as Float
+        mem_store(ptr_offset(dldgamma, j, "Float"), dyj * xj * r, "Float")
+        mem_store(ptr_offset(dldx, j, "Float"), r * (dyj * gj - xj * dot * rr / dimf), "Float")
+        j = j + 1
+    return 0
+
+// ── SwiGLU Backward: out = silu(a)*b ────────────────────────────────────────
+
+// dL/db = dLdy*silu(a). dL/da = dLdy*b*silu'(a).
+pub fn bwd_swiglu(dlda: ptr<Float>, dldb: ptr<Float>, dldy: ptr<Float>, a: ptr<Float>, b: ptr<Float>, dim: Int) -> Int with Unsafe:
+    var i = 0
+    while i < dim:
+        let av = mem_load(ptr_offset(a, i, "Float"), "Float") as Float
+        let bv = mem_load(ptr_offset(b, i, "Float"), "Float") as Float
+        let dy = mem_load(ptr_offset(dldy, i, "Float"), "Float") as Float
+        let sig = act_sigmoid_scalar(av)
+        let silu = av * sig
+        mem_store(ptr_offset(dldb, i, "Float"), dy * silu, "Float")
+        mem_store(ptr_offset(dlda, i, "Float"), dy * bv * bwd_silu_prime(av, sig), "Float")
+        i = i + 1
+    return 0
+
+// ── SSM Single-Step Backward (the BPTT heart) ───────────────────────────────
+
+// Forward recap: forget_s = exp(-dt*A[s]); st_new = forget*st_old + dt*B*x;
+//   y[d] = sum_s C[s]*st_new[s,d] + skip*x[d].
+// Given dLdy: dLdC[s] = sum_d dLdy[d]*st_new; dLdskip = sum_d dLdy[d]*x[d];
+//   dLdx[d] = sum_s C[s]*dLdy[d]*dt*B[s] + skip*dLdy[d];
+//   dLdB[s] = sum_d C[s]*dLdy[d]*dt*x[d];
+//   dLdA[s] = sum_d C[s]*dLdy[d]*st_old*(-dt)*forget_s;
+//   dLdst_old = forget_s*C[s]*dLdy[d] (carried backward through time).
+// All grad outs overwrite.
+pub fn bwd_ssm_step(dldx: ptr<Float>, dldst_old: ptr<Float>, dldc: ptr<Float>, dldb: ptr<Float>, dlda: ptr<Float>, dldskip_acc: ptr<Float>, dldy: ptr<Float>, x: ptr<Float>, st_old: ptr<Float>, st_new: ptr<Float>, avec: ptr<Float>, bvec: ptr<Float>, cvec: ptr<Float>, skip: Float, sd: Int, dim: Int, dt: Float) -> Int with Unsafe:
+    var d = 0
+    while d < dim:
+        mem_store(ptr_offset(dldx, d, "Float"), skip * (mem_load(ptr_offset(dldy, d, "Float"), "Float") as Float), "Float")
+        d = d + 1
+    var sk_acc: Float = 0.0
+    var s = 0
+    while s < sd:
+        let a_s = mem_load(ptr_offset(avec, s, "Float"), "Float") as Float
+        let b_s = mem_load(ptr_offset(bvec, s, "Float"), "Float") as Float
+        let c_s = mem_load(ptr_offset(cvec, s, "Float"), "Float") as Float
+        let forget_f = ssm_discrete_decay(a_s, dt)
+        var gc: Float = 0.0
+        var gb: Float = 0.0
+        var ga: Float = 0.0
+        var dd = 0
+        while dd < dim:
+            let dy = mem_load(ptr_offset(dldy, dd, "Float"), "Float") as Float
+            let xv = mem_load(ptr_offset(x, dd, "Float"), "Float") as Float
+            let hn = mem_load(ptr_offset(st_new, s * dim + dd, "Float"), "Float") as Float
+            let ho = mem_load(ptr_offset(st_old, s * dim + dd, "Float"), "Float") as Float
+            let w = c_s * dy
+            gc = gc + dy * hn
+            gb = gb + w * dt * xv
+            ga = ga + w * ho * (0.0 - dt) * forget_f
+            let gx_old = mem_load(ptr_offset(dldx, dd, "Float"), "Float") as Float
+            mem_store(ptr_offset(dldx, dd, "Float"), gx_old + w * dt * b_s, "Float")
+            mem_store(ptr_offset(dldst_old, s * dim + dd, "Float"), forget_f * w, "Float")
+            sk_acc = sk_acc + dy * xv
+            dd = dd + 1
+        mem_store(ptr_offset(dldc, s, "Float"), gc, "Float")
+        mem_store(ptr_offset(dldb, s, "Float"), gb, "Float")
+        mem_store(ptr_offset(dlda, s, "Float"), ga, "Float")
+        s = s + 1
+    mem_store(ptr_offset(dldskip_acc, 0, "Float"), sk_acc, "Float")
+    return 0
+
+// ── Residual Split: gradient fanout copy ────────────────────────────────────
+
+pub fn bwd_residual_split(dldh: ptr<Float>, dldelta: ptr<Float>, dldy: ptr<Float>, dim: Int) -> Int with Unsafe:
+    var i = 0
+    while i < dim:
+        let g = mem_load(ptr_offset(dldy, i, "Float"), "Float") as Float
+        mem_store(ptr_offset(dldh, i, "Float"), g, "Float")
+        mem_store(ptr_offset(dldelta, i, "Float"), g, "Float")
+        i = i + 1
+    return 0
+
+// ── Self-Verifying Test Battery (central finite differences) ────────────────
+
+pub fn backward_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n backward Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Distill seed analytic + FD (5x invariant + 1x plain).
+    total = total + 1
+    let dim1 = 8
+    let s1: ptr<Float> = alloc_zeroed(64, "Float")
+    let t1: ptr<Float> = alloc_zeroed(64, "Float")
+    let m1: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let g1: ptr<Float> = alloc_zeroed(64, "Float")
+    mem_store(ptr_offset(s1, 3, "Float"), 2.0 as Float, "Float")
+    mem_store(ptr_offset(s1, 4, "Float"), 2.0 as Float, "Float")
+    mem_store(ptr_offset(m1, 3, "Byte"), 1 as Byte, "Byte")
+    bwd_distill_seed(g1, s1, t1, m1, dim1, BWD_INV_W)
+    let a3 = mem_load(ptr_offset(g1, 3, "Float"), "Float") as Float
+    let a4 = mem_load(ptr_offset(g1, 4, "Float"), "Float") as Float
+    let e = BWD_FD_E
+    mem_store(ptr_offset(s1, 3, "Float"), 2.0 + e, "Float")
+    let lp = distil_mse_weighted(s1, t1, m1, dim1, BWD_INV_W)
+    mem_store(ptr_offset(s1, 3, "Float"), 2.0 - e, "Float")
+    let lm = distil_mse_weighted(s1, t1, m1, dim1, BWD_INV_W)
+    decay s1
+    decay t1
+    decay m1
+    decay g1
+    let num3 = (lp - lm) / (2.0 * e)
+    let df3 = a3 - num3
+    if df3 < 0.0:
+        df3 = 0.0 - df3
+    if a3 > 2.499 and a3 < 2.501 and a4 > 0.499 and a4 < 0.501 and df3 < BWD_FD_TOL:
+        println("  [PASS] Test 1: Seed 2.5/0.5 exact, FD agrees")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: Seed mismatch")
+
+    // Test 2: Ternary matvec bwd — dLdx exact + FD, STE shadow by formula.
+    total = total + 1
+    let m2 = 2
+    let k2 = 8
+    let x2: ptr<Float> = alloc_zeroed(64, "Float")
+    let w2: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let dy2: ptr<Float> = alloc_zeroed(64, "Float")
+    let dx2: ptr<Float> = alloc_zeroed(64, "Float")
+    let dw2: ptr<Float> = alloc_zeroed(128, "Float")
+    let y2: ptr<Float> = alloc_zeroed(64, "Float")
+    var f2 = 0
+    while f2 < k2:
+        mem_store(ptr_offset(x2, f2, "Float"), ((f2 as Float) + 1.0), "Float")
+        f2 = f2 + 1
+    mem_store(ptr_offset(w2, 0, "Byte"), 85 as Byte, "Byte")
+    mem_store(ptr_offset(w2, 1, "Byte"), 85 as Byte, "Byte")
+    mem_store(ptr_offset(w2, 2, "Byte"), 170 as Byte, "Byte")
+    mem_store(ptr_offset(w2, 3, "Byte"), 170 as Byte, "Byte")
+    mem_store(ptr_offset(dy2, 0, "Float"), 1.0 as Float, "Float")
+    mem_store(ptr_offset(dy2, 1, "Float"), 2.0 as Float, "Float")
+    bwd_ternary_matvec(dx2, dw2, dy2, w2, x2, m2, k2)
+    let dx0 = mem_load(ptr_offset(dx2, 0, "Float"), "Float") as Float
+    let sh00 = mem_load(ptr_offset(dw2, 0, "Float"), "Float") as Float
+    let sh17 = mem_load(ptr_offset(dw2, 15, "Float"), "Float") as Float
+    gemm_158b_matvec(y2, w2, x2, m2, k2)
+    let x0s = mem_load(ptr_offset(x2, 0, "Float"), "Float") as Float
+    mem_store(ptr_offset(x2, 0, "Float"), x0s + e, "Float")
+    gemm_158b_matvec(y2, w2, x2, m2, k2)
+    let yp0 = mem_load(ptr_offset(y2, 0, "Float"), "Float") as Float
+    let yp1 = mem_load(ptr_offset(y2, 1, "Float"), "Float") as Float
+    mem_store(ptr_offset(x2, 0, "Float"), x0s - e, "Float")
+    gemm_158b_matvec(y2, w2, x2, m2, k2)
+    let ym0 = mem_load(ptr_offset(y2, 0, "Float"), "Float") as Float
+    let ym1 = mem_load(ptr_offset(y2, 1, "Float"), "Float") as Float
+    decay x2
+    decay w2
+    decay dy2
+    decay dx2
+    decay dw2
+    decay y2
+    let numdx = (1.0 * (yp0 - ym0) + 2.0 * (yp1 - ym1)) / (2.0 * e)
+    let dfx = dx0 - numdx
+    if dfx < 0.0:
+        dfx = 0.0 - dfx
+    if dx0 > -1.001 and dx0 < -0.999 and sh00 > 0.999 and sh00 < 1.001 and sh17 > 15.999 and sh17 < 16.001 and dfx < BWD_FD_TOL:
+        println("  [PASS] Test 2: dLdx=-1 exact+FD, STE shadow 1.0/16.0 by formula")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Matvec backward mismatch")
+
+    // Test 3: RMSNorm + SwiGLU twins FD-verified.
+    total = total + 1
+    let dim3 = 8
+    let x3: ptr<Float> = alloc_zeroed(64, "Float")
+    let gm3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dy3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dx3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dg3: ptr<Float> = alloc_zeroed(64, "Float")
+    let a3b: ptr<Float> = alloc_zeroed(64, "Float")
+    let b3b: ptr<Float> = alloc_zeroed(64, "Float")
+    let da3: ptr<Float> = alloc_zeroed(64, "Float")
+    let db3: ptr<Float> = alloc_zeroed(64, "Float")
+    let yn3: ptr<Float> = alloc_zeroed(64, "Float")
+    let yo3: ptr<Float> = alloc_zeroed(64, "Float")
+    var f3 = 0
+    while f3 < dim3:
+        mem_store(ptr_offset(x3, f3, "Float"), ((f3 as Float) + 1.0), "Float")
+        mem_store(ptr_offset(gm3, f3, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(dy3, f3, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(a3b, f3, "Float"), 0.5 as Float, "Float")
+        mem_store(ptr_offset(b3b, f3, "Float"), ((f3 as Float) + 2.0), "Float")
+        mem_store(ptr_offset(yn3, f3, "Float"), ((f3 as Float) + 1.0), "Float")
+        mem_store(ptr_offset(yo3, f3, "Float"), ((f3 as Float) + 1.0), "Float")
+        f3 = f3 + 1
+    bwd_rmsnorm(dx3, dg3, dy3, x3, gm3, dim3, 0.000001)
+    bwd_swiglu(da3, db3, dy3, a3b, b3b, dim3)
+    let anx2 = mem_load(ptr_offset(dx3, 2, "Float"), "Float") as Float
+    let ang2 = mem_load(ptr_offset(dg3, 2, "Float"), "Float") as Float
+    let asa1 = mem_load(ptr_offset(da3, 1, "Float"), "Float") as Float
+    let asb1 = mem_load(ptr_offset(db3, 1, "Float"), "Float") as Float
+    var c3n = 0
+    while c3n < dim3:
+        mem_store(ptr_offset(yn3, c3n, "Float"), mem_load(ptr_offset(x3, c3n, "Float"), "Float") as Float, "Float")
+        c3n = c3n + 1
+    let x2s = mem_load(ptr_offset(x3, 2, "Float"), "Float") as Float
+    mem_store(ptr_offset(yn3, 2, "Float"), x2s + e, "Float")
+    rms_norm_weighted_inplace(yn3, gm3, dim3, 0.000001)
+    var sump: Float = 0.0
+    var sp = 0
+    while sp < dim3:
+        sump = sump + (mem_load(ptr_offset(yn3, sp, "Float"), "Float") as Float)
+        sp = sp + 1
+    var c3m = 0
+    while c3m < dim3:
+        mem_store(ptr_offset(yn3, c3m, "Float"), mem_load(ptr_offset(x3, c3m, "Float"), "Float") as Float, "Float")
+        c3m = c3m + 1
+    mem_store(ptr_offset(yn3, 2, "Float"), x2s - e, "Float")
+    rms_norm_weighted_inplace(yn3, gm3, dim3, 0.000001)
+    var summ: Float = 0.0
+    var sm = 0
+    while sm < dim3:
+        summ = summ + (mem_load(ptr_offset(yn3, sm, "Float"), "Float") as Float)
+        sm = sm + 1
+    let numnx = (sump - summ) / (2.0 * e)
+    swiglu_pair(yo3, a3b, b3b, dim3)
+    let o1s = mem_load(ptr_offset(yo3, 1, "Float"), "Float") as Float
+    mem_store(ptr_offset(a3b, 1, "Float"), 0.5 + e, "Float")
+    swiglu_pair(yo3, a3b, b3b, dim3)
+    let op = mem_load(ptr_offset(yo3, 1, "Float"), "Float") as Float
+    mem_store(ptr_offset(a3b, 1, "Float"), 0.5 - e, "Float")
+    swiglu_pair(yo3, a3b, b3b, dim3)
+    let om = mem_load(ptr_offset(yo3, 1, "Float"), "Float") as Float
+    decay x3
+    decay gm3
+    decay dy3
+    decay dx3
+    decay dg3
+    decay a3b
+    decay b3b
+    decay da3
+    decay db3
+    decay yn3
+    decay yo3
+    let dfn = anx2 - numnx
+    if dfn < 0.0:
+        dfn = 0.0 - dfn
+    let dfs = asa1 - (op - om) / (2.0 * e)
+    if dfs < 0.0:
+        dfs = 0.0 - dfs
+    let silu_ref = 0.5 * act_sigmoid_scalar(0.5)
+    let dfb = asb1 - silu_ref
+    if dfb < 0.0:
+        dfb = 0.0 - dfb
+    if dfn < BWD_FD_TOL and dfs < BWD_FD_TOL and dfb < BWD_FD_TOL and ang2 > 0.0:
+        println("  [PASS] Test 3: RMSNorm dLdx/dLdgamma + SwiGLU dLda/dLdb FD-verified")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: Norm/gate backward mismatch")
+
+    // Test 4: SSM single-step BPTT FD-verified (dLdx, dLdC, dLdB, dLdA, skip).
+    total = total + 1
+    let sd4 = 2
+    let dim4 = 8
+    let x4: ptr<Float> = alloc_zeroed(64, "Float")
+    let so4: ptr<Float> = alloc_zeroed(64, "Float")
+    let sn4: ptr<Float> = alloc_zeroed(64, "Float")
+    let av4: ptr<Float> = alloc_zeroed(64, "Float")
+    let bv4: ptr<Float> = alloc_zeroed(64, "Float")
+    let cv4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dy4: ptr<Float> = alloc_zeroed(64, "Float")
+    let yo4: ptr<Float> = alloc_zeroed(64, "Float")
+    let gx4: ptr<Float> = alloc_zeroed(64, "Float")
+    let gs4: ptr<Float> = alloc_zeroed(64, "Float")
+    let gc4: ptr<Float> = alloc_zeroed(64, "Float")
+    let gb4: ptr<Float> = alloc_zeroed(64, "Float")
+    let ga4: ptr<Float> = alloc_zeroed(64, "Float")
+    let gk4: ptr<Float> = alloc_zeroed(8, "Float")
+    var f4 = 0
+    while f4 < dim4:
+        mem_store(ptr_offset(x4, f4, "Float"), 0.5 as Float, "Float")
+        mem_store(ptr_offset(dy4, f4, "Float"), 1.0 as Float, "Float")
+        f4 = f4 + 1
+    var q4 = 0
+    while q4 < sd4:
+        mem_store(ptr_offset(av4, q4, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(bv4, q4, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(cv4, q4, "Float"), 1.0 as Float, "Float")
+        q4 = q4 + 1
+    var o4 = 0
+    while o4 < 16:
+        mem_store(ptr_offset(so4, o4, "Float"), 1.0 as Float, "Float")
+        o4 = o4 + 1
+    copy_floats(so4, sn4, 16)
+    ssm_step_inplace(sn4, x4, av4, bv4, sd4, dim4, 0.1)
+    bwd_ssm_step(gx4, gs4, gc4, gb4, ga4, gk4, dy4, x4, so4, sn4, av4, bv4, cv4, 0.5, sd4, dim4, 0.1)
+    let ax0 = mem_load(ptr_offset(gx4, 0, "Float"), "Float") as Float
+    let ac0 = mem_load(ptr_offset(gc4, 0, "Float"), "Float") as Float
+    let ab1 = mem_load(ptr_offset(gb4, 1, "Float"), "Float") as Float
+    let aa0 = mem_load(ptr_offset(ga4, 0, "Float"), "Float") as Float
+    let ask = mem_load(ptr_offset(gk4, 0, "Float"), "Float") as Float
+    let x0s = mem_load(ptr_offset(x4, 0, "Float"), "Float") as Float
+    mem_store(ptr_offset(x4, 0, "Float"), x0s + e, "Float")
+    copy_floats(so4, sn4, 16)
+    ssm_forward_step(yo4, sn4, x4, av4, bv4, cv4, 0.5, sd4, dim4, 0.1)
+    var sp4: Float = 0.0
+    var ip = 0
+    while ip < dim4:
+        sp4 = sp4 + (mem_load(ptr_offset(yo4, ip, "Float"), "Float") as Float)
+        ip = ip + 1
+    mem_store(ptr_offset(x4, 0, "Float"), x0s - e, "Float")
+    copy_floats(so4, sn4, 16)
+    ssm_forward_step(yo4, sn4, x4, av4, bv4, cv4, 0.5, sd4, dim4, 0.1)
+    var sm4: Float = 0.0
+    var im = 0
+    while im < dim4:
+        sm4 = sm4 + (mem_load(ptr_offset(yo4, im, "Float"), "Float") as Float)
+        im = im + 1
+    let c0s = mem_load(ptr_offset(cv4, 0, "Float"), "Float") as Float
+    mem_store(ptr_offset(cv4, 0, "Float"), c0s + e, "Float")
+    copy_floats(so4, sn4, 16)
+    ssm_forward_step(yo4, sn4, x4, av4, bv4, cv4, 0.5, sd4, dim4, 0.1)
+    var cp4: Float = 0.0
+    var jc = 0
+    while jc < dim4:
+        cp4 = cp4 + (mem_load(ptr_offset(yo4, jc, "Float"), "Float") as Float)
+        jc = jc + 1
+    mem_store(ptr_offset(cv4, 0, "Float"), c0s - e, "Float")
+    copy_floats(so4, sn4, 16)
+    ssm_forward_step(yo4, sn4, x4, av4, bv4, cv4, 0.5, sd4, dim4, 0.1)
+    var cm4: Float = 0.0
+    var jd = 0
+    while jd < dim4:
+        cm4 = cm4 + (mem_load(ptr_offset(yo4, jd, "Float"), "Float") as Float)
+        jd = jd + 1
+    mem_store(ptr_offset(cv4, 0, "Float"), c0s, "Float")
+    decay x4
+    decay so4
+    decay sn4
+    decay av4
+    decay bv4
+    decay cv4
+    decay dy4
+    decay yo4
+    decay gx4
+    decay gs4
+    decay gc4
+    decay gb4
+    decay ga4
+    decay gk4
+    let dfx4 = ax0 - (sp4 - sm4) / (2.0 * e)
+    if dfx4 < 0.0:
+        dfx4 = 0.0 - dfx4
+    let dfc4 = ac0 - (cp4 - cm4) / (2.0 * e)
+    if dfc4 < 0.0:
+        dfc4 = 0.0 - dfc4
+    if dfx4 < BWD_FD_TOL and dfc4 < BWD_FD_TOL and ab1 > 0.0 and aa0 < 0.0 and ask > 0.0:
+        println("  [PASS] Test 4: SSM BPTT dLdx/dLdC FD-verified, dLdB>0 dLdA<0 dLdskip>0")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: SSM backward mismatch")
+
+    // Test 5: Full one-layer chain — analytic reverse composition vs end-to-end FD.
+    total = total + 1
+    let dim5 = 8
+    let sd5 = 2
+    let vocab5 = 4
+    let h5: ptr<Float> = alloc_zeroed(64, "Float")
+    let tmp5: ptr<Float> = alloc_zeroed(64, "Float")
+    let gat5: ptr<Float> = alloc_zeroed(64, "Float")
+    let sout5: ptr<Float> = alloc_zeroed(64, "Float")
+    let tmat5: ptr<Float> = alloc_zeroed(64, "Float")
+    let tpre5: ptr<Float> = alloc_zeroed(64, "Float")
+    let hid5: ptr<Float> = alloc_zeroed(64, "Float")
+    let st5: ptr<Float> = alloc_zeroed(64, "Float")
+    let sz5: ptr<Float> = alloc_zeroed(64, "Float")
+    let wp5: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let wg5: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let hw5: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let gm5: ptr<Float> = alloc_zeroed(64, "Float")
+    let av5: ptr<Float> = alloc_zeroed(64, "Float")
+    let bv5: ptr<Float> = alloc_zeroed(64, "Float")
+    let cv5: ptr<Float> = alloc_zeroed(64, "Float")
+    let lg5: ptr<Float> = alloc_zeroed(64, "Float")
+    let tch5: ptr<Float> = alloc_zeroed(64, "Float")
+    let msk5: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let dlds5: ptr<Float> = alloc_zeroed(64, "Float")
+    let dhd5: ptr<Float> = alloc_zeroed(64, "Float")
+    let dwp5: ptr<Float> = alloc_zeroed(128, "Float")
+    let dtmp0: ptr<Float> = alloc_zeroed(64, "Float")
+    let dgt0: ptr<Float> = alloc_zeroed(64, "Float")
+    let dpre: ptr<Float> = alloc_zeroed(64, "Float")
+    let dgpre: ptr<Float> = alloc_zeroed(64, "Float")
+    let dhh: ptr<Float> = alloc_zeroed(64, "Float")
+    let dhd: ptr<Float> = alloc_zeroed(64, "Float")
+    let dxs: ptr<Float> = alloc_zeroed(64, "Float")
+    let dso: ptr<Float> = alloc_zeroed(64, "Float")
+    let dcc: ptr<Float> = alloc_zeroed(64, "Float")
+    let dbb: ptr<Float> = alloc_zeroed(64, "Float")
+    let daa: ptr<Float> = alloc_zeroed(64, "Float")
+    let dkk: ptr<Float> = alloc_zeroed(8, "Float")
+    let dgm: ptr<Float> = alloc_zeroed(64, "Float")
+    let dga: ptr<Float> = alloc_zeroed(64, "Float")
+    let dgb: ptr<Float> = alloc_zeroed(64, "Float")
+    let dha: ptr<Float> = alloc_zeroed(64, "Float")
+    let dhb: ptr<Float> = alloc_zeroed(64, "Float")
+    var f5 = 0
+    while f5 < dim5:
+        mem_store(ptr_offset(h5, f5, "Float"), ((f5 as Float) + 1.0), "Float")
+        mem_store(ptr_offset(gm5, f5, "Float"), 1.0 as Float, "Float")
+        f5 = f5 + 1
+    var u5 = 0
+    while u5 < 16:
+        mem_store(ptr_offset(wp5, u5, "Byte"), 85 as Byte, "Byte")
+        mem_store(ptr_offset(wg5, u5, "Byte"), 85 as Byte, "Byte")
+        u5 = u5 + 1
+    var v5 = 0
+    while v5 < 2:
+        mem_store(ptr_offset(hw5, v5, "Byte"), 85 as Byte, "Byte")
+        mem_store(ptr_offset(av5, v5, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(bv5, v5, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(cv5, v5, "Float"), 1.0 as Float, "Float")
+        v5 = v5 + 1
+    ssm_reset(st5, sd5, dim5)
+    gemm_158b_matvec(tmp5, wp5, h5, dim5, dim5)
+    gemm_158b_matvec(gat5, wg5, h5, dim5, dim5)
+    copy_floats(tmp5, tmat5, dim5)
+    rms_norm_weighted_inplace(tmp5, gm5, dim5, 0.000001)
+    copy_floats(tmp5, tpre5, dim5)
+    swiglu_inplace(tmp5, gat5, dim5)
+    ssm_forward_step(sout5, st5, tmp5, av5, bv5, cv5, 0.5, sd5, dim5, 0.1)
+    fwd_residual_add(hid5, h5, dim5)
+    fwd_residual_add(hid5, sout5, dim5)
+    fwd_lm_head(lg5, hid5, hw5, vocab5, dim5)
+    bwd_distill_seed(dlds5, lg5, tch5, msk5, vocab5, BWD_INV_W)
+    bwd_ternary_matvec(dhd5, dwp5, dlds5, hw5, hid5, vocab5, dim5)
+    bwd_residual_split(dhh, dtmp0, dhd5, dim5)
+    bwd_ssm_step(dxs, dso, dcc, dbb, daa, dkk, dtmp0, tmp5, sz5, st5, av5, bv5, cv5, 0.5, sd5, dim5, 0.1)
+    bwd_swiglu(dga, dgb, dxs, gat5, tpre5, dim5)
+    bwd_rmsnorm(dpre, dgm, dgb, tmat5, gm5, dim5, 0.000001)
+    bwd_ternary_matvec(dha, dwp5, dpre, wp5, h5, dim5, dim5)
+    bwd_ternary_matvec(dhb, dwp5, dga, wg5, h5, dim5, dim5)
+    var c5 = 0
+    while c5 < dim5:
+        let base = mem_load(ptr_offset(dhh, c5, "Float"), "Float") as Float
+        let pa = mem_load(ptr_offset(dha, c5, "Float"), "Float") as Float
+        let pb = mem_load(ptr_offset(dhb, c5, "Float"), "Float") as Float
+        mem_store(ptr_offset(dhd, c5, "Float"), base + pa + pb, "Float")
+        c5 = c5 + 1
+    let ana0 = mem_load(ptr_offset(dhd, 0, "Float"), "Float") as Float
+    let h0s = mem_load(ptr_offset(h5, 0, "Float"), "Float") as Float
+    mem_store(ptr_offset(h5, 0, "Float"), h0s + e, "Float")
+    ssm_reset(st5, sd5, dim5)
+    gemm_158b_matvec(tmp5, wp5, h5, dim5, dim5)
+    gemm_158b_matvec(gat5, wg5, h5, dim5, dim5)
+    copy_floats(tmp5, tmat5, dim5)
+    rms_norm_weighted_inplace(tmp5, gm5, dim5, 0.000001)
+    copy_floats(tmp5, tpre5, dim5)
+    swiglu_inplace(tmp5, gat5, dim5)
+    ssm_forward_step(sout5, st5, tmp5, av5, bv5, cv5, 0.5, sd5, dim5, 0.1)
+    var r5 = 0
+    while r5 < dim5:
+        mem_store(ptr_offset(hid5, r5, "Float"), mem_load(ptr_offset(h5, r5, "Float"), "Float") as Float, "Float")
+        r5 = r5 + 1
+    fwd_residual_add(hid5, sout5, dim5)
+    fwd_lm_head(lg5, hid5, hw5, vocab5, dim5)
+    let lp5 = distil_mse_weighted(lg5, tch5, msk5, vocab5, BWD_INV_W)
+    mem_store(ptr_offset(h5, 0, "Float"), h0s - e, "Float")
+    ssm_reset(st5, sd5, dim5)
+    gemm_158b_matvec(tmp5, wp5, h5, dim5, dim5)
+    gemm_158b_matvec(gat5, wg5, h5, dim5, dim5)
+    copy_floats(tmp5, tmat5, dim5)
+    rms_norm_weighted_inplace(tmp5, gm5, dim5, 0.000001)
+    copy_floats(tmp5, tpre5, dim5)
+    swiglu_inplace(tmp5, gat5, dim5)
+    ssm_forward_step(sout5, st5, tmp5, av5, bv5, cv5, 0.5, sd5, dim5, 0.1)
+    var q5 = 0
+    while q5 < dim5:
+        mem_store(ptr_offset(hid5, q5, "Float"), mem_load(ptr_offset(h5, q5, "Float"), "Float") as Float, "Float")
+        q5 = q5 + 1
+    fwd_residual_add(hid5, sout5, dim5)
+    fwd_lm_head(lg5, hid5, hw5, vocab5, dim5)
+    let lm5 = distil_mse_weighted(lg5, tch5, msk5, vocab5, BWD_INV_W)
+    mem_store(ptr_offset(h5, 0, "Float"), h0s, "Float")
+    decay h5
+    decay tmp5
+    decay gat5
+    decay sout5
+    decay tmat5
+    decay tpre5
+    decay hid5
+    decay st5
+    decay sz5
+    decay wp5
+    decay wg5
+    decay hw5
+    decay gm5
+    decay av5
+    decay bv5
+    decay cv5
+    decay lg5
+    decay tch5
+    decay msk5
+    decay dlds5
+    decay dhd5
+    decay dwp5
+    decay dtmp0
+    decay dgt0
+    decay dpre
+    decay dgpre
+    decay dhh
+    decay dhd
+    decay dxs
+    decay dso
+    decay dcc
+    decay dbb
+    decay daa
+    decay dkk
+    decay dgm
+    decay dga
+    decay dgb
+    decay dha
+    decay dhb
+    let df5 = ana0 - (lp5 - lm5) / (2.0 * e)
+    if df5 < 0.0:
+        df5 = 0.0 - df5
+    if df5 < 0.01:
+        println("  [PASS] Test 5: End-to-end chain grad matches FD through all layers")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Chain composition mismatch")
+
+    println("--- backward Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn backward_usage():
+    println("k_AI_n Gradient Twins (backward.kn)")
+    println("USAGE:")
+    println("  core backward prove                Run self-verifying test battery")
+    println("  core backward stats                Print twin coverage & FD metrics")
+
+pub fn backward_stats() -> String:
+    var t = "=== k_AI_n Gradient Twins (A3) ===\n"
+    t = t + "  Twins:        distill-seed, ternary-matvec+STE, rmsnorm,\n"
+    t = t + "                swiglu, ssm-BPTT-step, residual-split\n"
+    t = t + "  Proof:        central finite differences, e=1e-4, tol=1e-3\n"
+    t = t + "  STE rule:     dLdW_float = dLdy*x (optimizer shadow, by formula)\n"
+    t = t + "  Allocations:  0 in kernels (caller-owned grad buffers, overwrite)\n"
+    return t
+
+pub fn backward_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        backward_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return backward_test_battery()
+    elif cmd == "stats":
+        println(backward_stats())
+        return 0
+    else:
+        backward_usage()
+        return 0

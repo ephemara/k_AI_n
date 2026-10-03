@@ -23,3 +23,6 @@ entropy_screener	kain/core/entropy_screener.kn	llvm	draft	pending	Shannon entrop
 ast_verifier	kain/core/ast_verifier.kn	llvm	draft	pending	Syntax tree compiler validation gate	2026-10-01
 binary_packer	kain/core/binary_packer.kn	llvm	proven	5/5 tests green; header+magic, record roundtrip, batch stride rows, u64 codec verified	Contiguous 64-byte aligned .kain_bin packager	2026-10-01
 distill_loss	kain/core/distill_loss.kn	llvm	proven	5/5 tests green; zero-loss, 0.5 single-diff, 2.5 invariant-5x, temp+top1, batch-0.25 verified	Invariant-weighted loss calculator	2026-10-01
+forward	kain/core/forward.kn	llvm	proven	5/5 tests green; embed rows+clamp, layer determinism, seq finite+nonzero+pos-diff, zero-weight passthrough, dims/contract verified	Assembled model forward pass (A2)	2026-10-03
+backward	kain/core/backward.kn	llvm	proven	5/5 tests green; seed 2.5/0.5+FD, matvec dLdx+STE, norm/gate FD, SSM-BPTT FD, end-to-end chain FD verified	Gradient twins + FD proofs (A3)	2026-10-03
+train	kain/core/train.kn	llvm	proven	5/5 tests green; Adam 1.0->0.9 exact, quantize byte 9, embed-step drop, 50-tok 13290->22 collapse, dims/contract verified	Adam + overfit gate (A4)	2026-10-03

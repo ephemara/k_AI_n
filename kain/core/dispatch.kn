@@ -26,6 +26,9 @@ pub fn core_usage():
     println("  pack <subcommand>          .kain_bin Training Stream Packager (prove, stats)")
     println("  distill <subcommand>       Invariant-Weighted Distill Loss (prove, stats)")
     println("  ssm <subcommand>           O(1) Liquid Memory SSM (prove, stats)")
+    println("  forward <subcommand>       Assembled Model Forward Pass (prove, stats)")
+    println("  backward <subcommand>      Gradient Twins + FD Proofs (prove, stats)")
+    println("  train <subcommand>         Adam + Overfit Gate (prove, stats)")
     println("  gemm <subcommand>          1.58-Bit Ternary GEMM Engine (prove, stats)")
     println("  activations <subcommand>   Fused RMSNorm/SwiGLU/RoPE Suite (prove, stats)")
     println("  tokenizer <subcommand>     16k Alien Tokenizer (encode, decode, stats, prove)")
@@ -47,56 +50,74 @@ fn main() -> Int with Unsafe:
     // Global Test Suite
     if cmd == "prove" or cmd == "test":
         core_banner()
-        println("[1/8] Testing Core Substrate & Memory Arenas (_common.kn)...")
+        println("[1/11] Testing Core Substrate & Memory Arenas (_common.kn)...")
         let common_rc = common_test_battery()
         if common_rc != 0:
             println("error: _common.kn test battery failed with exit code " + str(common_rc))
             return common_rc
 
-        println("[2/8] Testing 16k Alien Tokenizer (tokenizer_16k.kn)...")
+        println("[2/11] Testing 16k Alien Tokenizer (tokenizer_16k.kn)...")
         let tok_rc = tokenizer_test_battery()
         if tok_rc != 0:
             println("error: tokenizer_16k.kn test battery failed with exit code " + str(tok_rc))
             return tok_rc
 
-        println("[3/8] Testing 1.58-Bit Ternary GEMM Engine (gemm_158b.kn)...")
+        println("[3/11] Testing 1.58-Bit Ternary GEMM Engine (gemm_158b.kn)...")
         let gemm_rc = gemm_test_battery()
         if gemm_rc != 0:
             println("error: gemm_158b.kn test battery failed with exit code " + str(gemm_rc))
             return gemm_rc
 
-        println("[4/8] Testing Fused Activation Suite (activations.kn)...")
+        println("[4/11] Testing Fused Activation Suite (activations.kn)...")
         let act_rc = activations_test_battery()
         if act_rc != 0:
             println("error: activations.kn test battery failed with exit code " + str(act_rc))
             return act_rc
 
-        println("[5/8] Testing O(1) Liquid Memory (ssm_liquid.kn)...")
+        println("[5/11] Testing O(1) Liquid Memory (ssm_liquid.kn)...")
         let ssm_rc = ssm_test_battery()
         if ssm_rc != 0:
             println("error: ssm_liquid.kn test battery failed with exit code " + str(ssm_rc))
             return ssm_rc
 
-        println("[6/8] Testing Invariant-Weighted Distill Loss (distill_loss.kn)...")
+        println("[6/11] Testing Invariant-Weighted Distill Loss (distill_loss.kn)...")
         let dist_rc = distill_test_battery()
         if dist_rc != 0:
             println("error: distill_loss.kn test battery failed with exit code " + str(dist_rc))
             return dist_rc
 
-        println("[7/8] Testing .kain_bin Training Stream (binary_packer.kn)...")
+        println("[7/11] Testing .kain_bin Training Stream (binary_packer.kn)...")
         let pack_rc = binpack_test_battery()
         if pack_rc != 0:
             println("error: binary_packer.kn test battery failed with exit code " + str(pack_rc))
             return pack_rc
 
-        println("[8/8] Testing Architecture Config (config.kn)...")
+        println("[8/11] Testing Architecture Config (config.kn)...")
         let cfg_rc = config_test_battery()
         if cfg_rc != 0:
             println("error: config.kn test battery failed with exit code " + str(cfg_rc))
             return cfg_rc
 
+        println("[9/11] Testing Assembled Model Forward (forward.kn)...")
+        let fwd_rc = forward_test_battery()
+        if fwd_rc != 0:
+            println("error: forward.kn test battery failed with exit code " + str(fwd_rc))
+            return fwd_rc
+
+        println("[10/11] Testing Gradient Twins (backward.kn)...")
+        let bwd_rc = backward_test_battery()
+        if bwd_rc != 0:
+            println("error: backward.kn test battery failed with exit code " + str(bwd_rc))
+            return bwd_rc
+
+        println("[11/11] Testing Adam + Overfit Gate (train.kn)...")
+        let trn_rc = train_test_battery()
+        if trn_rc != 0:
+            println("error: train.kn test battery failed with exit code " + str(trn_rc))
+            return trn_rc
+
         println("======================================================================")
-        println("  ALL SELF-TEST BATTERIES PASSED (41/41 checks green)")
+        println("  ALL SELF-TEST BATTERIES PASSED (56/56 checks green)")
         println("======================================================================")
         return 0
 
@@ -162,6 +183,33 @@ fn main() -> Int with Unsafe:
             push(sub_args, args[i])
             i = i + 1
         return tokenizer_main(sub_args)
+
+    // Assembled Forward Subsystem
+    elif cmd == "forward" or cmd == "fwd":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return forward_main(sub_args)
+
+    // Gradient Twins Subsystem
+    elif cmd == "backward" or cmd == "bwd":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return backward_main(sub_args)
+
+    // Trainer Subsystem
+    elif cmd == "train" or cmd == "trn":
+        let mut sub_args: Array<String> = []
+        var i = 1
+        while i < len(args):
+            push(sub_args, args[i])
+            i = i + 1
+        return train_main(sub_args)
 
     // Common Memory Subsystem
     elif cmd == "common":

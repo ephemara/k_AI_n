@@ -545,7 +545,12 @@ Columns: `module  source  target  status  receipt  notes  updated` (tab-separate
 - **Effect-annotated functions MUST declare a return type (bled for in `binary_packer`):**
   A `pub fn f(...) with Unsafe:` with NO `-> Type` that does real work and gets called
   segfaults (exit 127/139) at the call site. Bare `pub fn f():` is only safe for trivial
-  print-only usages with no `with` clause. Always write `-> Int` + explicit `return 0`:
+  print-only usages with no `with` clause. Always write `-> Int` + explicit `return 0`.
+  Refinement (Oct 2026, re-bled in A3): single-expression stores (`bstore`/`fstore`/`istore`)
+  survive without it, but LOOP-BODIED effect fns (`copy_floats`, `zero_floats`) segfault —
+  and they hid inside proven-green `_common.kn` because no battery ever CALLED them until
+  A3. Latent crashers in green modules are real: when wiring a new caller, spike-probe
+  the callee first if it lacks `-> Type`:
   ```kn
   // CRASHES at call site (exit 127):
   pub fn bin_write_u64(buf: ptr<Byte>, off: Int, v: Int) with Unsafe:
@@ -586,22 +591,24 @@ Columns: `module  source  target  status  receipt  notes  updated` (tab-separate
 We are executing the **Step 0 Pilot — Phase A (Assemble the Student)**.
 
 ### Fused Suite Status (see `docs/status/` snapshots; verify live with `./kain/core.exe prove`)
-- **9 modules fused** via `kain amalgamate --raw kain/core -o kain/core.kn` → LLVM `kain/core.exe`.
-- **41/41 self-test checks green.** Per-module batteries: `_common` 6/6, `tokenizer_16k` 5/5,
+- **12 modules fused** via `kain amalgamate --raw kain/core -o kain/core.kn` → LLVM `kain/core.exe`.
+- **56/56 self-test checks green.** Per-module batteries: `_common` 6/6, `tokenizer_16k` 5/5,
   `gemm_158b` 5/5, `activations` 5/5, `ssm_liquid` 5/5, `distill_loss` 5/5, `binary_packer` 5/5,
-  `config` 5/5. `dispatch` owns the only `main()` and routes `prove` + 8 subcommands
-  (`common`, `tokenizer`, `gemm`, `act`, `ssm`, `distill`, `pack`, `config`).
+  `config` 5/5, `forward` 5/5, `backward` 5/5, `train` 5/5. `dispatch` owns the only `main()`
+  and routes `prove` + 11 subcommands (`common`, `tokenizer`, `gemm`, `act`, `ssm`,
+  `distill`, `pack`, `config`, `forward`, `backward`/`bwd`, `train`/`trn`).
 - **Presets locked in `config.kn`:** Step-0 ≈ 134M params (~92MB ternary + 12.6MB fixed state),
   Step-1 ≈ 1.31B params (~504MB + 50MB). Census/footprint estimators with tested bands.
 
-### Phase A Scoreboard (the learning machine, $0 spent, CPU only)
+### Phase A Scoreboard (the learning machine, $0 spent, CPU only) — COMPLETE 4/4
 - [x] **A1. `config.kn`** — hyperparameters, census, cross-module contract receipts.
-- [ ] **A2. Model forward** — embedding + N×(gemm→norm→swiglu→ssm) + LM-head → real logits.
-- [ ] **A3. Backward twins** — gradient kernel per forward kernel (SSM BPTT leads), each with
-  finite-difference numeric checks. This is the biggest remaining block.
-- [ ] **A4. Adam + 50-token overfit** — loss → ~0 on CPU. Proof the machine learns.
+- [x] **A2. `forward.kn`** — embedding + N×(gemm→norm→swiglu→ssm) + LM-head → real logits.
+- [x] **A3. `backward.kn`** — gradient twin per forward kernel (SSM BPTT leads), each with
+  finite-difference numeric checks + end-to-end chain proof.
+- [x] **A4. `train.kn`** — Adam + 50-token overfit gate: 13290 → 22 (604× collapse) on CPU.
+  Absolute ~0-loss tuning is forge work (bigger dims, longer schedules), not assembly work.
 
-### Phase B/C Pointer (do NOT start yet — Phase A is the critical path)
+### Phase B/C Pointer (Phase A COMPLETE — Phase B is the critical path)
 - **Phase B (Python + data):** teacher setup in `python/` (Qwen-2.5-Coder, vocab slice to 16k),
   `entropy_screener` + `ast_verifier` refinery, teacher-logit harvest → `train.kain_bin`.
 - **Phase C (forge):** Vast.ai RTX 4090s are rented and waiting. Vast boxes are **Linux** —

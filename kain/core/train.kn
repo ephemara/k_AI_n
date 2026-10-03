@@ -1,0 +1,740 @@
+// ============================================================================
+//  k_AI_n :: train.kn — Adam + 50-Token Overfit Gate (Phase A4)
+// ============================================================================
+//  Subsystem 4: Recurrent Hybrid & Equilibrium Model (the learning proof)
+//  Architecture:
+//    - Adam kernel (bias-corrected first/second moments, per-element):
+//        m = b1*m + (1-b1)*g; v = b2*v + (1-b2)*g*g
+//        p -= lr * (m/(1-b1^t)) / (sqrt(v/(1-b2^t)) + eps)
+//    - TRUE QAT loop: float shadows --quantize--> packed ternary
+//      --forward--> loss --backward(STE)--> Adam on shadows. The discrete
+//      weights the GPU will run are IN the training loop, not beside it.
+//    - Full BPTT: per-position cache (h_in, tmat, tpre, tact, gate, states,
+//      hid, logits) + reversed backward with dcarry state-gradients carried
+//      across positions per layer: carry_p = kernel_out + forget*carry_{p+1}.
+//    - Learnable floats: embed, shadows (proj/gate/head), gamma, A/B/C,
+//      skip. Bwd kernels overwrite; this loop OWNS accumulation into grad
+//      arenas (zeroed per step).
+//    - THE GATE: 50 fixed tokens, teacher pattern, N Adam steps, loss must
+//      collapse (relative-drop receipt + absolute printout).
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines peer symbols. Calls forward/bwd/gemm/ssm/distill
+//      kernels + CFG-style literals passed as params by the demo.
+//    - All new symbols use TRN_ prefix or trn_ scope.
+// ============================================================================
+
+use std::runtime
+use std::math
+use std::intent
+
+// ── Train Constants (TRN_ scoped, no collisions) ────────────────────────────
+
+pub const TRN_B1: Float = 0.9
+pub const TRN_B2: Float = 0.999
+pub const TRN_EPS: Float = 0.00000001
+pub const TRN_LR: Float = 0.02
+pub const TRN_QTHRESH: Float = 0.05
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law trn_adam_valid(lr: Float, b1: Float, b2: Float) -> Bool:
+    return lr > 0.0 and lr < 1.0 and b1 > 0.0 and b1 < 1.0 and b2 > 0.0 and b2 < 1.0 and b1 < b2
+
+pub law trn_step_valid(t: Int) -> Bool:
+    return t > 0 and t <= 1000000
+
+pub law trn_dims_valid(dim: Int, sd: Int, layers: Int, vocab: Int, seq: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0 and sd > 0 and layers > 0 and layers <= 8 and vocab > 0 and vocab <= 16384 and seq > 0 and seq <= 256
+
+// ── Converge Block: Adam denominator (spec vs fast lane) ────────────────────
+
+pub converge trn_adam_denom(vh: Float, eps: Float) -> Float:
+    spec reference:
+        return sqrt(vh) + eps
+    fast fast_lane when capability("cpu.x86.avx2"):
+        return sqrt(vh) + eps
+    verify random(8)
+
+// ── Adam Single-Parameter-Arena Step ────────────────────────────────────────
+
+pub fn adam_step(p: ptr<Float>, g: ptr<Float>, m: ptr<Float>, v: ptr<Float>, n: Int, lr: Float, b1: Float, b2: Float, eps: Float, t: Int) -> Int with Unsafe:
+    let tf = t as Float
+    let c1 = 1.0 - pow(b1, tf)
+    let c2 = 1.0 - pow(b2, tf)
+    let g1 = 1.0 - b1
+    let g2 = 1.0 - b2
+    var i = 0
+    while i < n:
+        let gi = mem_load(ptr_offset(g, i, "Float"), "Float") as Float
+        let mi = mem_load(ptr_offset(m, i, "Float"), "Float") as Float
+        let vi = mem_load(ptr_offset(v, i, "Float"), "Float") as Float
+        let nm = b1 * mi + g1 * gi
+        let nv = b2 * vi + g2 * gi * gi
+        mem_store(ptr_offset(m, i, "Float"), nm, "Float")
+        mem_store(ptr_offset(v, i, "Float"), nv, "Float")
+        let mh = nm / c1
+        let vh = nv / c2
+        let pv = mem_load(ptr_offset(p, i, "Float"), "Float") as Float
+        mem_store(ptr_offset(p, i, "Float"), pv - lr * mh / trn_adam_denom(vh, eps), "Float")
+        i = i + 1
+    return 0
+
+// ── Zero a Float Arena Range (overwrite, for per-step grad reset) ───────────
+
+pub fn trn_zero_grads(g: ptr<Float>, n: Int) -> Int with Unsafe:
+    var i = 0
+    while i < n:
+        mem_store(ptr_offset(g, i, "Float"), 0.0 as Float, "Float")
+        i = i + 1
+    return 0
+
+// ── Accumulate Add (acc += src, n elements) ─────────────────────────────────
+
+pub fn trn_accum_add(acc: ptr<Float>, src: ptr<Float>, n: Int) -> Int with Unsafe:
+    var i = 0
+    while i < n:
+        let a = mem_load(ptr_offset(acc, i, "Float"), "Float") as Float
+        let s = mem_load(ptr_offset(src, i, "Float"), "Float") as Float
+        mem_store(ptr_offset(acc, i, "Float"), a + s, "Float")
+        i = i + 1
+    return 0
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn train_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n train Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Adam single-step hand receipt (p=1,g=0.5 -> 0.9) + laws.
+    total = total + 1
+    let p1: ptr<Float> = alloc_zeroed(8, "Float")
+    let g1: ptr<Float> = alloc_zeroed(8, "Float")
+    let m1: ptr<Float> = alloc_zeroed(8, "Float")
+    let v1: ptr<Float> = alloc_zeroed(8, "Float")
+    mem_store(ptr_offset(p1, 0, "Float"), 1.0 as Float, "Float")
+    mem_store(ptr_offset(g1, 0, "Float"), 0.5 as Float, "Float")
+    adam_step(p1, g1, m1, v1, 1, 0.1, 0.9, 0.999, 0.00000001, 1)
+    let p1v = mem_load(ptr_offset(p1, 0, "Float"), "Float") as Float
+    let m1v = mem_load(ptr_offset(m1, 0, "Float"), "Float") as Float
+    decay p1
+    decay g1
+    decay m1
+    decay v1
+    let l1 = trn_adam_valid(0.02, 0.9, 0.999)
+    let l2 = trn_adam_valid(2.0, 0.9, 0.999)
+    let l3 = trn_step_valid(300)
+    let l4 = trn_step_valid(0)
+    if p1v > 0.8999 and p1v < 0.9001 and m1v > 0.0499 and m1v < 0.0501 and l1 and (l2 == false) and l3 and (l4 == false):
+        println("  [PASS] Test 1: Adam step 1.0->0.9 exact, laws passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: Adam math mismatch")
+
+    // Test 2: Shadow quantize wiring ([0.5,-0.5,0.01,-0.01] -> byte 9).
+    total = total + 1
+    let sh2: ptr<Float> = alloc_zeroed(8, "Float")
+    let pk2: ptr<Byte> = alloc_zeroed(8, "Byte")
+    mem_store(ptr_offset(sh2, 0, "Float"), 0.5 as Float, "Float")
+    mem_store(ptr_offset(sh2, 1, "Float"), 0.0 - 0.5 as Float, "Float")
+    mem_store(ptr_offset(sh2, 2, "Float"), 0.01 as Float, "Float")
+    mem_store(ptr_offset(sh2, 3, "Float"), 0.0 - 0.01 as Float, "Float")
+    quantize_floats_to_packed2b(sh2, pk2, 4, TRN_QTHRESH)
+    let b2v = mem_load(ptr_offset(pk2, 0, "Byte"), "Int") & 255
+    decay sh2
+    decay pk2
+    if b2v == 9:
+        println("  [PASS] Test 2: Quantize wiring [+, -, 0, 0] -> byte 9")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Quantize mismatch")
+
+    // Test 3: One embed-only Adam step strictly reduces loss (smooth path).
+    total = total + 1
+    let dim3 = 8
+    let sd3 = 2
+    let vocab3 = 4
+    let h3: ptr<Float> = alloc_zeroed(64, "Float")
+    let e3: ptr<Float> = alloc_zeroed(64, "Float")
+    let t3a: ptr<Float> = alloc_zeroed(64, "Float")
+    let t3b: ptr<Float> = alloc_zeroed(64, "Float")
+    let s3o: ptr<Float> = alloc_zeroed(64, "Float")
+    let st3: ptr<Float> = alloc_zeroed(64, "Float")
+    let w3p: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let w3g: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let w3h: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let gm3: ptr<Float> = alloc_zeroed(64, "Float")
+    let av3: ptr<Float> = alloc_zeroed(64, "Float")
+    let bv3: ptr<Float> = alloc_zeroed(64, "Float")
+    let cv3: ptr<Float> = alloc_zeroed(64, "Float")
+    let lg3: ptr<Float> = alloc_zeroed(64, "Float")
+    let tc3: ptr<Float> = alloc_zeroed(64, "Float")
+    let mk3: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let ds3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dh3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dw3: ptr<Float> = alloc_zeroed(128, "Float")
+    let ge3: ptr<Float> = alloc_zeroed(64, "Float")
+    let me3: ptr<Float> = alloc_zeroed(64, "Float")
+    let ve3: ptr<Float> = alloc_zeroed(64, "Float")
+    let tmat3: ptr<Float> = alloc_zeroed(64, "Float")
+    let tpre3: ptr<Float> = alloc_zeroed(64, "Float")
+    let sz3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dhx3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dtm3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dxs3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dso3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dcc3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dbb3: ptr<Float> = alloc_zeroed(64, "Float")
+    let daa3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dkk3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dga3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dgb3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dpr3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dha3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dhb3: ptr<Float> = alloc_zeroed(64, "Float")
+    let dgm3: ptr<Float> = alloc_zeroed(64, "Float")
+    var f3 = 0
+    while f3 < 32:
+        mem_store(ptr_offset(e3, f3, "Float"), ((((f3 * 37 + 11) % 13) as Float) - 6.0) * 0.15, "Float")
+        f3 = f3 + 1
+    var u3 = 0
+    while u3 < 16:
+        mem_store(ptr_offset(w3p, u3, "Byte"), 85 as Byte, "Byte")
+        mem_store(ptr_offset(w3g, u3, "Byte"), 85 as Byte, "Byte")
+        u3 = u3 + 1
+    mem_store(ptr_offset(w3h, 0, "Byte"), 85 as Byte, "Byte")
+    mem_store(ptr_offset(w3h, 1, "Byte"), 85 as Byte, "Byte")
+    var y3 = 0
+    while y3 < dim3:
+        mem_store(ptr_offset(gm3, y3, "Float"), 1.0 as Float, "Float")
+        y3 = y3 + 1
+    mem_store(ptr_offset(av3, 0, "Float"), 1.0 as Float, "Float")
+    mem_store(ptr_offset(av3, 1, "Float"), 1.0 as Float, "Float")
+    mem_store(ptr_offset(bv3, 0, "Float"), 1.0 as Float, "Float")
+    mem_store(ptr_offset(bv3, 1, "Float"), 1.0 as Float, "Float")
+    mem_store(ptr_offset(cv3, 0, "Float"), 1.0 as Float, "Float")
+    mem_store(ptr_offset(cv3, 1, "Float"), 1.0 as Float, "Float")
+    mem_store(ptr_offset(tc3, 0, "Float"), 3.0 as Float, "Float")
+    mem_store(ptr_offset(tc3, 2, "Float"), 0.0 - 2.0 as Float, "Float")
+    fwd_embed_lookup(h3, e3, 2, dim3, vocab3)
+    gemm_158b_matvec(t3a, w3p, h3, dim3, dim3)
+    gemm_158b_matvec(t3b, w3g, h3, dim3, dim3)
+    copy_floats(t3a, tmat3, dim3)
+    rms_norm_weighted_inplace(t3a, gm3, dim3, 0.000001)
+    copy_floats(t3a, tpre3, dim3)
+    swiglu_inplace(t3a, t3b, dim3)
+    ssm_reset(st3, sd3, dim3)
+    ssm_forward_step(s3o, st3, t3a, av3, bv3, cv3, 0.5, sd3, dim3, 0.1)
+    fwd_residual_add(h3, s3o, dim3)
+    fwd_lm_head(lg3, h3, w3h, vocab3, dim3)
+    let loss0 = distil_mse_weighted(lg3, tc3, mk3, vocab3, 5.0)
+    bwd_distill_seed(ds3, lg3, tc3, mk3, vocab3, 5.0)
+    bwd_ternary_matvec(dh3, dw3, ds3, w3h, h3, vocab3, dim3)
+    bwd_residual_split(dhx3, dtm3, dh3, dim3)
+    bwd_ssm_step(dxs3, dso3, dcc3, dbb3, daa3, dkk3, dtm3, t3a, sz3, st3, av3, bv3, cv3, 0.5, sd3, dim3, 0.1)
+    bwd_swiglu(dga3, dgb3, dxs3, t3b, tpre3, dim3)
+    bwd_rmsnorm(dpr3, dgm3, dgb3, tmat3, gm3, dim3, 0.000001)
+    bwd_ternary_matvec(dha3, dw3, dpr3, w3p, h3, dim3, dim3)
+    bwd_ternary_matvec(dhb3, dw3, dga3, w3g, h3, dim3, dim3)
+    var c3 = 0
+    while c3 < dim3:
+        let tokbase = 2 * dim3 + c3
+        let bse3 = mem_load(ptr_offset(dhx3, c3, "Float"), "Float") as Float
+        let paa3 = mem_load(ptr_offset(dha3, c3, "Float"), "Float") as Float
+        let pbb3 = mem_load(ptr_offset(dhb3, c3, "Float"), "Float") as Float
+        let gv = mem_load(ptr_offset(ge3, tokbase, "Float"), "Float") as Float
+        mem_store(ptr_offset(ge3, tokbase, "Float"), gv + bse3 + paa3 + pbb3, "Float")
+        c3 = c3 + 1
+    adam_step(e3, ge3, me3, ve3, 32, 0.05, 0.9, 0.999, 0.00000001, 1)
+    fwd_embed_lookup(h3, e3, 2, dim3, vocab3)
+    gemm_158b_matvec(t3a, w3p, h3, dim3, dim3)
+    gemm_158b_matvec(t3b, w3g, h3, dim3, dim3)
+    rms_norm_weighted_inplace(t3a, gm3, dim3, 0.000001)
+    swiglu_inplace(t3a, t3b, dim3)
+    ssm_reset(st3, sd3, dim3)
+    ssm_forward_step(s3o, st3, t3a, av3, bv3, cv3, 0.5, sd3, dim3, 0.1)
+    fwd_residual_add(h3, s3o, dim3)
+    fwd_lm_head(lg3, h3, w3h, vocab3, dim3)
+    let loss1 = distil_mse_weighted(lg3, tc3, mk3, vocab3, 5.0)
+    decay h3
+    decay e3
+    decay t3a
+    decay t3b
+    decay s3o
+    decay st3
+    decay w3p
+    decay w3g
+    decay w3h
+    decay gm3
+    decay av3
+    decay bv3
+    decay cv3
+    decay lg3
+    decay tc3
+    decay mk3
+    decay ds3
+    decay dh3
+    decay dw3
+    decay ge3
+    decay me3
+    decay ve3
+    decay tmat3
+    decay tpre3
+    decay sz3
+    decay dhx3
+    decay dtm3
+    decay dxs3
+    decay dso3
+    decay dcc3
+    decay dbb3
+    decay daa3
+    decay dkk3
+    decay dga3
+    decay dgb3
+    decay dpr3
+    decay dha3
+    decay dhb3
+    decay dgm3
+    if loss1 < loss0 and loss0 > 0.001:
+        println("  [PASS] Test 3: Embed Adam step reduces loss (" + str(loss0) + " -> " + str(loss1) + ")")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: No loss reduction")
+
+    // Test 4: THE GATE — 50-token QAT overfit, loss must collapse.
+    total = total + 1
+    let dim4 = 16
+    let sd4 = 4
+    let layers4 = 2
+    let vocab4 = 16
+    let seq4 = 50
+    let steps4 = 200
+    let ebytes = vocab4 * dim4
+    let pemb = ebytes
+    let pgamma = layers4 * dim4
+    let pabc = layers4 * sd4
+    let pproj = layers4 * dim4 * dim4
+    let phead = vocab4 * dim4
+    let packproj = layers4 * dim4 * dim4 / 4
+    let packhead = vocab4 * dim4 / 4
+    let embed4: ptr<Float> = alloc_zeroed(512, "Float")
+    let gamma4: ptr<Float> = alloc_zeroed(64, "Float")
+    let avec4: ptr<Float> = alloc_zeroed(16, "Float")
+    let bvec4: ptr<Float> = alloc_zeroed(16, "Float")
+    let cvec4: ptr<Float> = alloc_zeroed(16, "Float")
+    let skip4: ptr<Float> = alloc_zeroed(8, "Float")
+    let shp4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let shg4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let shh4: ptr<Float> = alloc_zeroed(512, "Float")
+    let wpk4: ptr<Byte> = alloc_zeroed(512, "Byte")
+    let wgk4: ptr<Byte> = alloc_zeroed(512, "Byte")
+    let whk4: ptr<Byte> = alloc_zeroed(128, "Byte")
+    let geb4: ptr<Float> = alloc_zeroed(512, "Float")
+    let gga4: ptr<Float> = alloc_zeroed(64, "Float")
+    let gab4: ptr<Float> = alloc_zeroed(16, "Float")
+    let gbb4: ptr<Float> = alloc_zeroed(16, "Float")
+    let gcb4: ptr<Float> = alloc_zeroed(16, "Float")
+    let gsk4: ptr<Float> = alloc_zeroed(8, "Float")
+    let gsp4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let gsg4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let gsh4: ptr<Float> = alloc_zeroed(512, "Float")
+    let meb4: ptr<Float> = alloc_zeroed(512, "Float")
+    let veb4: ptr<Float> = alloc_zeroed(512, "Float")
+    let mga4: ptr<Float> = alloc_zeroed(64, "Float")
+    let vga4: ptr<Float> = alloc_zeroed(64, "Float")
+    let mab4: ptr<Float> = alloc_zeroed(16, "Float")
+    let vab4: ptr<Float> = alloc_zeroed(16, "Float")
+    let mbb4: ptr<Float> = alloc_zeroed(16, "Float")
+    let vbb4: ptr<Float> = alloc_zeroed(16, "Float")
+    let mcb4: ptr<Float> = alloc_zeroed(16, "Float")
+    let vcb4: ptr<Float> = alloc_zeroed(16, "Float")
+    let msk4: ptr<Float> = alloc_zeroed(8, "Float")
+    let vsk4: ptr<Float> = alloc_zeroed(8, "Float")
+    let msp4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let vsp4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let msg4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let vsg4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let msh4: ptr<Float> = alloc_zeroed(512, "Float")
+    let vsh4: ptr<Float> = alloc_zeroed(512, "Float")
+    let tok4: ptr<Int> = alloc_zeroed(64, "Int")
+    let tch4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let mskb4: ptr<Byte> = alloc_zeroed(1024, "Byte")
+    let lg4: ptr<Float> = alloc_zeroed(1024, "Float")
+    let hid4: ptr<Float> = alloc_zeroed(64, "Float")
+    let tmp4: ptr<Float> = alloc_zeroed(64, "Float")
+    let gat4: ptr<Float> = alloc_zeroed(64, "Float")
+    let sou4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dy4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dh4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dt04: ptr<Float> = alloc_zeroed(64, "Float")
+    let dxs4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dpr4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dga4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dgb4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dha4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dhb4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dhx4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dhy4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dgm4: ptr<Float> = alloc_zeroed(64, "Float")
+    let dwf4: ptr<Float> = alloc_zeroed(512, "Float")
+    let dso4: ptr<Float> = alloc_zeroed(128, "Float")
+    let dcc4: ptr<Float> = alloc_zeroed(16, "Float")
+    let dbb4: ptr<Float> = alloc_zeroed(16, "Float")
+    let daa4: ptr<Float> = alloc_zeroed(16, "Float")
+    let dkk4: ptr<Float> = alloc_zeroed(8, "Float")
+    let dcy4: ptr<Float> = alloc_zeroed(256, "Float")
+    let st4: ptr<Float> = alloc_zeroed(512, "Float")
+    let hinc4: ptr<Float> = alloc_zeroed(2048, "Float")
+    let tmatc4: ptr<Float> = alloc_zeroed(2048, "Float")
+    let tprec4: ptr<Float> = alloc_zeroed(2048, "Float")
+    let tactc4: ptr<Float> = alloc_zeroed(2048, "Float")
+    let gatc4: ptr<Float> = alloc_zeroed(2048, "Float")
+    let stalc4: ptr<Float> = alloc_zeroed(8192, "Float")
+    let hidc4: ptr<Float> = alloc_zeroed(1024, "Float")
+    var ie = 0
+    while ie < pemb:
+        mem_store(ptr_offset(embed4, ie, "Float"), ((((ie * 37 + 11) % 13) as Float) - 6.0) * 0.15, "Float")
+        ie = ie + 1
+    var ig = 0
+    while ig < pgamma:
+        mem_store(ptr_offset(gamma4, ig, "Float"), 1.0 as Float, "Float")
+        ig = ig + 1
+    var ia = 0
+    while ia < pabc:
+        mem_store(ptr_offset(avec4, ia, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(bvec4, ia, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(cvec4, ia, "Float"), 1.0 as Float, "Float")
+        ia = ia + 1
+    mem_store(ptr_offset(skip4, 0, "Float"), 0.5 as Float, "Float")
+    mem_store(ptr_offset(skip4, 1, "Float"), 0.5 as Float, "Float")
+    var ip = 0
+    while ip < pproj:
+        mem_store(ptr_offset(shp4, ip, "Float"), ((((ip * 37 + 11) % 13) as Float) - 6.0) * 0.15, "Float")
+        mem_store(ptr_offset(shg4, ip, "Float"), ((((ip * 53 + 7) % 13) as Float) - 6.0) * 0.15, "Float")
+        ip = ip + 1
+    var ih = 0
+    while ih < phead:
+        mem_store(ptr_offset(shh4, ih, "Float"), ((((ih * 41 + 5) % 13) as Float) - 6.0) * 0.15, "Float")
+        ih = ih + 1
+    var it = 0
+    while it < seq4:
+        mem_store(ptr_offset(tok4, it, "Int"), (it * 7 + 3) % vocab4, "Int")
+        var iv = 0
+        while iv < vocab4:
+            mem_store(ptr_offset(tch4, it * vocab4 + iv, "Float"), ((((it * 13 + iv * 7) % 11) as Float) - 5.0), "Float")
+            if (iv % 4) == 0:
+                mem_store(ptr_offset(mskb4, it * vocab4 + iv, "Byte"), 1 as Byte, "Byte")
+            iv = iv + 1
+        it = it + 1
+    quantize_floats_to_packed2b(shp4, wpk4, pproj, TRN_QTHRESH)
+    quantize_floats_to_packed2b(shg4, wgk4, pproj, TRN_QTHRESH)
+    quantize_floats_to_packed2b(shh4, whk4, phead, TRN_QTHRESH)
+    let stelems = sd4 * dim4
+    let stplane = (seq4 + 1) * stelems
+    var lz = 0
+    while lz < layers4:
+        ssm_reset(ptr_offset(st4, lz * stelems, "Float"), sd4, dim4)
+        lz = lz + 1
+    var pp = 0
+    while pp < seq4:
+        let tk = mem_load(ptr_offset(tok4, pp, "Int"), "Int")
+        fwd_embed_lookup(hid4, embed4, tk, dim4, vocab4)
+        var ll = 0
+        while ll < layers4:
+            let wpr = ptr_offset(wpk4, ll * dim4 * dim4 / 4, "Byte")
+            let wgr = ptr_offset(wgk4, ll * dim4 * dim4 / 4, "Byte")
+            let adr = ptr_offset(avec4, ll * sd4, "Float")
+            let bbr = ptr_offset(bvec4, ll * sd4, "Float")
+            let ccr = ptr_offset(cvec4, ll * sd4, "Float")
+            let gmr = ptr_offset(gamma4, ll * dim4, "Float")
+            let str = ptr_offset(st4, ll * stelems, "Float")
+            let skv = mem_load(ptr_offset(skip4, ll, "Float"), "Float") as Float
+            fwd_layer_step(hid4, tmp4, gat4, str, wpr, wgr, adr, bbr, ccr, gmr, skv, dim4, sd4, 0.000001, 0.1)
+            ll = ll + 1
+        fwd_lm_head(ptr_offset(lg4, pp * vocab4, "Float"), hid4, whk4, vocab4, dim4)
+        pp = pp + 1
+    let loss_init = distil_loss_batch(lg4, tch4, mskb4, seq4, vocab4, 5.0)
+    var step = 0
+    while step < steps4:
+        quantize_floats_to_packed2b(shp4, wpk4, pproj, TRN_QTHRESH)
+        quantize_floats_to_packed2b(shg4, wgk4, pproj, TRN_QTHRESH)
+        quantize_floats_to_packed2b(shh4, whk4, phead, TRN_QTHRESH)
+        trn_zero_grads(geb4, pemb)
+        trn_zero_grads(gga4, pgamma)
+        trn_zero_grads(gab4, pabc)
+        trn_zero_grads(gbb4, pabc)
+        trn_zero_grads(gcb4, pabc)
+        trn_zero_grads(gsk4, layers4)
+        trn_zero_grads(gsp4, pproj)
+        trn_zero_grads(gsg4, pproj)
+        trn_zero_grads(gsh4, phead)
+        trn_zero_grads(dcy4, layers4 * stelems)
+        var lz2 = 0
+        while lz2 < layers4:
+            ssm_reset(ptr_offset(st4, lz2 * stelems, "Float"), sd4, dim4)
+            lz2 = lz2 + 1
+        var pf = 0
+        while pf < seq4:
+            let tkf = mem_load(ptr_offset(tok4, pf, "Int"), "Int")
+            fwd_embed_lookup(hid4, embed4, tkf, dim4, vocab4)
+            var lf = 0
+            while lf < layers4:
+                copy_floats(hid4, ptr_offset(hinc4, (lf * seq4 + pf) * dim4, "Float"), dim4)
+                let wprf = ptr_offset(wpk4, lf * dim4 * dim4 / 4, "Byte")
+                let wgrf = ptr_offset(wgk4, lf * dim4 * dim4 / 4, "Byte")
+                let adrf = ptr_offset(avec4, lf * sd4, "Float")
+                let bbrf = ptr_offset(bvec4, lf * sd4, "Float")
+                let ccrf = ptr_offset(cvec4, lf * sd4, "Float")
+                let gmrf = ptr_offset(gamma4, lf * dim4, "Float")
+                let strf = ptr_offset(st4, lf * stelems, "Float")
+                let skvf = mem_load(ptr_offset(skip4, lf, "Float"), "Float") as Float
+                gemm_158b_matvec(tmp4, wprf, hid4, dim4, dim4)
+                gemm_158b_matvec(gat4, wgrf, hid4, dim4, dim4)
+                copy_floats(tmp4, ptr_offset(tmatc4, (lf * seq4 + pf) * dim4, "Float"), dim4)
+                rms_norm_weighted_inplace(tmp4, gmrf, dim4, 0.000001)
+                copy_floats(tmp4, ptr_offset(tprec4, (lf * seq4 + pf) * dim4, "Float"), dim4)
+                swiglu_inplace(tmp4, gat4, dim4)
+                copy_floats(tmp4, ptr_offset(tactc4, (lf * seq4 + pf) * dim4, "Float"), dim4)
+                copy_floats(gat4, ptr_offset(gatc4, (lf * seq4 + pf) * dim4, "Float"), dim4)
+                copy_floats(strf, ptr_offset(stalc4, lf * stplane + pf * stelems, "Float"), stelems)
+                ssm_forward_step(sou4, strf, tmp4, adrf, bbrf, ccrf, skvf, sd4, dim4, 0.1)
+                copy_floats(strf, ptr_offset(stalc4, lf * stplane + (pf + 1) * stelems, "Float"), stelems)
+                fwd_residual_add(hid4, sou4, dim4)
+                lf = lf + 1
+            copy_floats(hid4, ptr_offset(hidc4, pf * dim4, "Float"), dim4)
+            fwd_lm_head(ptr_offset(lg4, pf * vocab4, "Float"), hid4, whk4, vocab4, dim4)
+            pf = pf + 1
+        var pb = seq4 - 1
+        while pb >= 0:
+            bwd_distill_seed(dy4, ptr_offset(lg4, pb * vocab4, "Float"), ptr_offset(tch4, pb * vocab4, "Float"), ptr_offset(mskb4, pb * vocab4, "Byte"), vocab4, 5.0)
+            let hpb = ptr_offset(hidc4, pb * dim4, "Float")
+            bwd_ternary_matvec(dh4, dwf4, dy4, whk4, hpb, vocab4, dim4)
+            trn_accum_add(gsh4, dwf4, phead)
+            var lb = layers4 - 1
+            var dcur = 0
+            while dcur < dim4:
+                mem_store(ptr_offset(dhx4, dcur, "Float"), mem_load(ptr_offset(dh4, dcur, "Float"), "Float") as Float, "Float")
+                dcur = dcur + 1
+            while lb >= 0:
+                bwd_residual_split(dhy4, dt04, dhx4, dim4)
+                let adrb = ptr_offset(avec4, lb * sd4, "Float")
+                let bbrb = ptr_offset(bvec4, lb * sd4, "Float")
+                let ccrb = ptr_offset(cvec4, lb * sd4, "Float")
+                let skvb = mem_load(ptr_offset(skip4, lb, "Float"), "Float") as Float
+                let txb = ptr_offset(tactc4, (lb * seq4 + pb) * dim4, "Float")
+                let sob = ptr_offset(stalc4, lb * stplane + pb * stelems, "Float")
+                let snb = ptr_offset(stalc4, lb * stplane + (pb + 1) * stelems, "Float")
+                bwd_ssm_step(dxs4, dso4, dcc4, dbb4, daa4, dkk4, dt04, txb, sob, snb, adrb, bbrb, ccrb, skvb, sd4, dim4, 0.1)
+                var cy = 0
+                while cy < stelems:
+                    let kval = mem_load(ptr_offset(dso4, cy, "Float"), "Float") as Float
+                    let cvv = mem_load(ptr_offset(dcy4, lb * stelems + cy, "Float"), "Float") as Float
+                    mem_store(ptr_offset(dso4, cy, "Float"), kval + cvv, "Float")
+                    cy = cy + 1
+                trn_accum_add(ptr_offset(gcb4, lb * sd4, "Float"), dcc4, sd4)
+                trn_accum_add(ptr_offset(gbb4, lb * sd4, "Float"), dbb4, sd4)
+                trn_accum_add(ptr_offset(gab4, lb * sd4, "Float"), daa4, sd4)
+                let skg = mem_load(ptr_offset(dkk4, 0, "Float"), "Float") as Float
+                let skold = mem_load(ptr_offset(gsk4, lb, "Float"), "Float") as Float
+                mem_store(ptr_offset(gsk4, lb, "Float"), skold + skg, "Float")
+                var cw = 0
+                while cw < stelems:
+                    let fgv = ssm_discrete_decay(mem_load(ptr_offset(adrb, cw / dim4, "Float"), "Float") as Float, 0.1)
+                    let ncv = mem_load(ptr_offset(dso4, cw, "Float"), "Float") as Float
+                    mem_store(ptr_offset(dcy4, lb * stelems + cw, "Float"), fgv * ncv, "Float")
+                    cw = cw + 1
+                let gab = ptr_offset(gatc4, (lb * seq4 + pb) * dim4, "Float")
+                let tpb = ptr_offset(tprec4, (lb * seq4 + pb) * dim4, "Float")
+                bwd_swiglu(dga4, dgb4, dxs4, gab, tpb, dim4)
+                let tmb = ptr_offset(tmatc4, (lb * seq4 + pb) * dim4, "Float")
+                bwd_rmsnorm(dpr4, dgm4, dgb4, tmb, ptr_offset(gamma4, lb * dim4, "Float"), dim4, 0.000001)
+                trn_accum_add(ptr_offset(gga4, lb * dim4, "Float"), dgm4, dim4)
+                let hxb = ptr_offset(hinc4, (lb * seq4 + pb) * dim4, "Float")
+                bwd_ternary_matvec(dha4, dwf4, dpr4, ptr_offset(wpk4, lb * dim4 * dim4 / 4, "Byte"), hxb, dim4, dim4)
+                trn_accum_add(ptr_offset(gsp4, lb * dim4 * dim4, "Float"), dwf4, dim4 * dim4)
+                bwd_ternary_matvec(dhb4, dwf4, dga4, ptr_offset(wgk4, lb * dim4 * dim4 / 4, "Byte"), hxb, dim4, dim4)
+                trn_accum_add(ptr_offset(gsg4, lb * dim4 * dim4, "Float"), dwf4, dim4 * dim4)
+                var cm = 0
+                while cm < dim4:
+                    let bse = mem_load(ptr_offset(dhy4, cm, "Float"), "Float") as Float
+                    let paa = mem_load(ptr_offset(dha4, cm, "Float"), "Float") as Float
+                    let pbb = mem_load(ptr_offset(dhb4, cm, "Float"), "Float") as Float
+                    mem_store(ptr_offset(dhx4, cm, "Float"), bse + paa + pbb, "Float")
+                    cm = cm + 1
+                lb = lb - 1
+            let tkb = mem_load(ptr_offset(tok4, pb, "Int"), "Int")
+            var ce = 0
+            while ce < dim4:
+                let eb = tkb * dim4 + ce
+                let gvo = mem_load(ptr_offset(geb4, eb, "Float"), "Float") as Float
+                let hvo = mem_load(ptr_offset(dhx4, ce, "Float"), "Float") as Float
+                mem_store(ptr_offset(geb4, eb, "Float"), gvo + hvo, "Float")
+                ce = ce + 1
+            pb = pb - 1
+        let tt = step + 1
+        adam_step(embed4, geb4, meb4, veb4, pemb, TRN_LR, TRN_B1, TRN_B2, TRN_EPS, tt)
+        adam_step(gamma4, gga4, mga4, vga4, pgamma, TRN_LR, TRN_B1, TRN_B2, TRN_EPS, tt)
+        adam_step(avec4, gab4, mab4, vab4, pabc, TRN_LR, TRN_B1, TRN_B2, TRN_EPS, tt)
+        adam_step(bvec4, gbb4, mbb4, vbb4, pabc, TRN_LR, TRN_B1, TRN_B2, TRN_EPS, tt)
+        adam_step(cvec4, gcb4, mcb4, vcb4, pabc, TRN_LR, TRN_B1, TRN_B2, TRN_EPS, tt)
+        adam_step(skip4, gsk4, msk4, vsk4, layers4, TRN_LR, TRN_B1, TRN_B2, TRN_EPS, tt)
+        adam_step(shp4, gsp4, msp4, vsp4, pproj, TRN_LR, TRN_B1, TRN_B2, TRN_EPS, tt)
+        adam_step(shg4, gsg4, msg4, vsg4, pproj, TRN_LR, TRN_B1, TRN_B2, TRN_EPS, tt)
+        adam_step(shh4, gsh4, msh4, vsh4, phead, TRN_LR, TRN_B1, TRN_B2, TRN_EPS, tt)
+        step = step + 1
+    quantize_floats_to_packed2b(shp4, wpk4, pproj, TRN_QTHRESH)
+    quantize_floats_to_packed2b(shg4, wgk4, pproj, TRN_QTHRESH)
+    quantize_floats_to_packed2b(shh4, whk4, phead, TRN_QTHRESH)
+    var lz3 = 0
+    while lz3 < layers4:
+        ssm_reset(ptr_offset(st4, lz3 * stelems, "Float"), sd4, dim4)
+        lz3 = lz3 + 1
+    var pe = 0
+    while pe < seq4:
+        let tke = mem_load(ptr_offset(tok4, pe, "Int"), "Int")
+        fwd_embed_lookup(hid4, embed4, tke, dim4, vocab4)
+        var le = 0
+        while le < layers4:
+            let wpre = ptr_offset(wpk4, le * dim4 * dim4 / 4, "Byte")
+            let wgre = ptr_offset(wgk4, le * dim4 * dim4 / 4, "Byte")
+            let adre = ptr_offset(avec4, le * sd4, "Float")
+            let bbre = ptr_offset(bvec4, le * sd4, "Float")
+            let ccre = ptr_offset(cvec4, le * sd4, "Float")
+            let gmre = ptr_offset(gamma4, le * dim4, "Float")
+            let stre = ptr_offset(st4, le * stelems, "Float")
+            let skve = mem_load(ptr_offset(skip4, le, "Float"), "Float") as Float
+            fwd_layer_step(hid4, tmp4, gat4, stre, wpre, wgre, adre, bbre, ccre, gmre, skve, dim4, sd4, 0.000001, 0.1)
+            le = le + 1
+        fwd_lm_head(ptr_offset(lg4, pe * vocab4, "Float"), hid4, whk4, vocab4, dim4)
+        pe = pe + 1
+    let loss_final = distil_loss_batch(lg4, tch4, mskb4, seq4, vocab4, 5.0)
+    decay embed4
+    decay gamma4
+    decay avec4
+    decay bvec4
+    decay cvec4
+    decay skip4
+    decay shp4
+    decay shg4
+    decay shh4
+    decay wpk4
+    decay wgk4
+    decay whk4
+    decay geb4
+    decay gga4
+    decay gab4
+    decay gbb4
+    decay gcb4
+    decay gsk4
+    decay gsp4
+    decay gsg4
+    decay gsh4
+    decay meb4
+    decay veb4
+    decay mga4
+    decay vga4
+    decay mab4
+    decay vab4
+    decay mbb4
+    decay vbb4
+    decay mcb4
+    decay vcb4
+    decay msk4
+    decay vsk4
+    decay msp4
+    decay vsp4
+    decay msg4
+    decay vsg4
+    decay msh4
+    decay vsh4
+    decay tok4
+    decay tch4
+    decay mskb4
+    decay lg4
+    decay hid4
+    decay tmp4
+    decay gat4
+    decay sou4
+    decay dy4
+    decay dh4
+    decay dt04
+    decay dxs4
+    decay dpr4
+    decay dga4
+    decay dgb4
+    decay dha4
+    decay dhb4
+    decay dhx4
+    decay dhy4
+    decay dgm4
+    decay dwf4
+    decay dso4
+    decay dcc4
+    decay dbb4
+    decay daa4
+    decay dkk4
+    decay dcy4
+    decay st4
+    decay hinc4
+    decay tmatc4
+    decay tprec4
+    decay tactc4
+    decay gatc4
+    decay stalc4
+    decay hidc4
+    if loss_final < loss_init * 0.15 and loss_init > 0.01:
+        println("  [PASS] Test 4: 50-token overfit collapse (" + str(loss_init) + " -> " + str(loss_final) + ")")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: Overfit gate missed (" + str(loss_init) + " -> " + str(loss_final) + ")")
+
+    // Test 5: Dimension + Adam/CFG contract laws.
+    total = total + 1
+    let d1 = trn_dims_valid(16, 4, 2, 16, 50)
+    let d2 = trn_dims_valid(15, 4, 2, 16, 50)
+    let d3 = trn_dims_valid(16, 4, 2, 16, 0)
+    let c_lr = TRN_LR > 0.019 and TRN_LR < 0.021
+    let c_b = TRN_B1 > 0.899 and TRN_B1 < 0.901
+    let c_q = TRN_QTHRESH > 0.049 and TRN_QTHRESH < 0.051
+    if d1 and (d2 == false) and (d3 == false) and c_lr and c_b and c_q:
+        println("  [PASS] Test 5: Train dims + Adam/QAT contract passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Laws/contract failed")
+
+    println("--- train Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn train_usage():
+    println("k_AI_n Adam + Overfit Gate (train.kn)")
+    println("USAGE:")
+    println("  core train prove                   Run self-verifying test battery")
+    println("  core train stats                   Print trainer & gate metrics")
+
+pub fn train_stats() -> String:
+    var t = "=== k_AI_n Adam + Overfit Gate (A4) ===\n"
+    t = t + "  Optimizer:    Adam b1=0.9 b2=0.999 eps=1e-8, bias-corrected\n"
+    t = t + "  Loop:         QAT shadows->ternary->forward->BPTT->Adam\n"
+    t = t + "  Gate:         50 tokens, 200 steps, loss must collapse 6.7x+\n"
+    t = t + "  Learnable:    embed, shadows, gamma, SSM A/B/C/skip\n"
+    t = t + "  Allocations:  0 in kernels (caller-owned grads, overwrite)\n"
+    return t
+
+pub fn train_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        train_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return train_test_battery()
+    elif cmd == "stats":
+        println(train_stats())
+        return 0
+    else:
+        train_usage()
+        return 0

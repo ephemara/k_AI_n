@@ -1,0 +1,437 @@
+// ============================================================================
+//  k_AI_n :: forward.kn — Assembled Model Forward Pass (Phase A2)
+// ============================================================================
+//  Subsystem 4: Recurrent Hybrid & Equilibrium Model (the assembler)
+//  Architecture:
+//    - THE glue relay turning isolated kernels into real logits:
+//        embed lookup -> per layer [ternary proj -> gamma RMSNorm ->
+//        SwiGLU gate -> SSM fused forward+skip -> residual add] ->
+//        ternary LM-head -> logits row.
+//    - Persistent per-layer SSM state across the sequence (O(1) memory,
+//      history compresses in place; states reset at sequence start).
+//    - Logits layout is row-major seq x vocab: DIRECT feed for
+//      distil_loss_batch with zero transpose (forge glue).
+//    - ZERO allocations in the hot path: every buffer is caller-owned.
+//      Thresholds (eps, dt) are CALLER PARAMS (AGENTS.md Rule 5 — dispatch
+//      passes CFG_RMS_EPS / CFG_SSM_DT; tests pass matching literals).
+//
+//  GLUE CONTRACT (Amalgamation Charter Law 1):
+//    - NEVER redefines _common/gemm/activations/ssm/distill/packer/config.
+//    - Calls ONLY: gemm_158b_matvec, rms_norm_weighted_inplace,
+//      swiglu_inplace, ssm_reset, ssm_forward_step.
+//    - All new symbols use FWD_ prefix or fwd_ scope.
+// ============================================================================
+
+use std::runtime
+use std::intent
+
+// ── Forward Constants (FWD_ scoped, no collisions) ──────────────────────────
+
+pub const FWD_VOCAB_MAX: Int = 16383
+pub const FWD_EPS_DEFAULT: Float = 0.000001
+pub const FWD_DT_DEFAULT: Float = 0.1
+pub const FWD_SKIP_DEFAULT: Float = 0.5
+pub const FWD_LOSS_CEIL: Float = 1000000.0
+
+// ── Invariant Laws (uniquely named) ─────────────────────────────────────────
+
+pub law fwd_dims_valid(dim: Int, state_dim: Int, layers: Int) -> Bool:
+    return dim > 0 and (dim % 8) == 0 and state_dim > 0 and layers > 0 and layers <= 128
+
+pub law fwd_seq_valid(seq: Int, vocab: Int) -> Bool:
+    return seq > 0 and seq <= 8192 and vocab > 0 and vocab <= 16384
+
+pub law fwd_logit_finite(v: Float) -> Bool:
+    return v >= -1000000000.0 and v <= 1000000000.0
+
+// ── Converge Block: Residual Add Scalar (spec vs fast lane) ─────────────────
+
+pub converge fwd_resid_add(h: Float, d: Float) -> Float:
+    spec reference:
+        return h + d
+    fast fast_lane when capability("cpu.x86.avx2"):
+        return h + d
+    verify random(8)
+
+// ── Embedding Lookup (token id -> hidden row, clamped) ─────────────────────
+
+pub fn fwd_embed_lookup(hidden: ptr<Float>, table: ptr<Float>, tok: Int, dim: Int, vocab: Int) -> Int with Unsafe:
+    var t = tok
+    if t < 0:
+        t = 0
+    if t >= vocab:
+        t = vocab - 1
+    let row_base = t * dim
+    var j = 0
+    while j < dim:
+        let v = mem_load(ptr_offset(table, row_base + j, "Float"), "Float") as Float
+        mem_store(ptr_offset(hidden, j, "Float"), v, "Float")
+        j = j + 1
+    return 0
+
+// ── Residual Add (hidden += delta, IN-PLACE) ────────────────────────────────
+
+pub fn fwd_residual_add(hidden: ptr<Float>, delta: ptr<Float>, dim: Int) -> Int with Unsafe:
+    var i = 0
+    while i < dim:
+        let h = mem_load(ptr_offset(hidden, i, "Float"), "Float") as Float
+        let d = mem_load(ptr_offset(delta, i, "Float"), "Float") as Float
+        mem_store(ptr_offset(hidden, i, "Float"), fwd_resid_add(h, d), "Float")
+        i = i + 1
+    return 0
+
+// ── LM-Head (logits_row = Head * hidden, ternary matvec) ────────────────────
+
+pub fn fwd_lm_head(logits_row: ptr<Float>, hidden: ptr<Float>, head_w: ptr<Byte>, vocab: Int, dim: Int) -> Int with Unsafe:
+    return gemm_158b_matvec(logits_row, head_w, hidden, vocab, dim)
+
+// ── Single Layer Step (THE relay: proj -> norm -> swiglu -> ssm -> resid) ───
+
+pub fn fwd_layer_step(hidden: ptr<Float>, tmp_b: ptr<Float>, gate_b: ptr<Float>, st: ptr<Float>, w_proj: ptr<Byte>, w_gate: ptr<Byte>, a_d: ptr<Float>, b_v: ptr<Float>, c_v: ptr<Float>, gamma: ptr<Float>, skip: Float, dim: Int, state_dim: Int, eps: Float, dt: Float) -> Int with Unsafe:
+    gemm_158b_matvec(tmp_b, w_proj, hidden, dim, dim)
+    gemm_158b_matvec(gate_b, w_gate, hidden, dim, dim)
+    rms_norm_weighted_inplace(tmp_b, gamma, dim, eps)
+    swiglu_inplace(tmp_b, gate_b, dim)
+    ssm_forward_step(gate_b, st, tmp_b, a_d, b_v, c_v, skip, state_dim, dim, dt)
+    fwd_residual_add(hidden, gate_b, dim)
+    return 0
+
+// ── Full Sequence Forward (resets states, loops positions x layers) ─────────
+
+pub fn fwd_forward_seq(logits_buf: ptr<Float>, tokens: ptr<Int>, seq_len: Int, embed_table: ptr<Float>, vocab: Int, dim: Int, w_proj_all: ptr<Byte>, w_gate_all: ptr<Byte>, a_all: ptr<Float>, b_all: ptr<Float>, c_all: ptr<Float>, gamma_all: ptr<Float>, skip_vec: ptr<Float>, head_w: ptr<Byte>, state_all: ptr<Float>, state_dim: Int, layers: Int, tmp_buf: ptr<Float>, gate_buf: ptr<Float>, hidden_buf: ptr<Float>, eps: Float, dt: Float) -> Int with Unsafe:
+    let proj_bytes = (dim * dim) / 4
+    let st_elems = state_dim * dim
+    var lr = 0
+    while lr < layers:
+        ssm_reset(ptr_offset(state_all, lr * st_elems, "Float"), state_dim, dim)
+        lr = lr + 1
+    var p = 0
+    while p < seq_len:
+        let tok = mem_load(ptr_offset(tokens, p, "Int"), "Int")
+        fwd_embed_lookup(hidden_buf, embed_table, tok, dim, vocab)
+        var ly = 0
+        while ly < layers:
+            let wproj = ptr_offset(w_proj_all, ly * proj_bytes, "Byte")
+            let wgate = ptr_offset(w_gate_all, ly * proj_bytes, "Byte")
+            let ad = ptr_offset(a_all, ly * state_dim, "Float")
+            let bv = ptr_offset(b_all, ly * state_dim, "Float")
+            let cv = ptr_offset(c_all, ly * state_dim, "Float")
+            let gm = ptr_offset(gamma_all, ly * dim, "Float")
+            let st = ptr_offset(state_all, ly * st_elems, "Float")
+            let sk = mem_load(ptr_offset(skip_vec, ly, "Float"), "Float") as Float
+            fwd_layer_step(hidden_buf, tmp_buf, gate_buf, st, wproj, wgate, ad, bv, cv, gm, sk, dim, state_dim, eps, dt)
+            ly = ly + 1
+        let logits_row = ptr_offset(logits_buf, p * vocab, "Float")
+        fwd_lm_head(logits_row, hidden_buf, head_w, vocab, dim)
+        p = p + 1
+    return 0
+
+// ── Self-Verifying Test Battery ─────────────────────────────────────────────
+
+pub fn forward_test_battery() -> Int with Unsafe:
+    println("--- Running k_AI_n forward Self-Test Battery ---")
+    var passed = 0
+    var total = 0
+
+    // Test 1: Embedding lookup exact rows + upper clamp.
+    total = total + 1
+    let dim1 = 8
+    let vocab1 = 16
+    let tab1: ptr<Float> = alloc_zeroed(256, "Float")
+    let hid1: ptr<Float> = alloc_zeroed(64, "Float")
+    var fi = 0
+    while fi < vocab1:
+        var fj = 0
+        while fj < dim1:
+            mem_store(ptr_offset(tab1, fi * dim1 + fj, "Float"), ((fi * 10 + fj) as Float), "Float")
+            fj = fj + 1
+        fi = fi + 1
+    fwd_embed_lookup(hid1, tab1, 3, dim1, vocab1)
+    let e0 = mem_load(ptr_offset(hid1, 0, "Float"), "Float") as Float
+    let e7 = mem_load(ptr_offset(hid1, 7, "Float"), "Float") as Float
+    fwd_embed_lookup(hid1, tab1, 99, dim1, vocab1)
+    let ec = mem_load(ptr_offset(hid1, 0, "Float"), "Float") as Float
+    decay tab1
+    decay hid1
+    if e0 > 29.999 and e0 < 30.001 and e7 > 36.999 and e7 < 37.001 and ec > 149.999 and ec < 150.001:
+        println("  [PASS] Test 1: Embed rows exact (tok3=[30..37]), clamp tok99->row15")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 1: Embed lookup mismatch")
+
+    // Test 2: Single layer step deterministic + finite.
+    total = total + 1
+    let dim2 = 8
+    let sd2 = 4
+    let ha: ptr<Float> = alloc_zeroed(64, "Float")
+    let hb: ptr<Float> = alloc_zeroed(64, "Float")
+    let tmp2: ptr<Float> = alloc_zeroed(64, "Float")
+    let gat2: ptr<Float> = alloc_zeroed(64, "Float")
+    let sta: ptr<Float> = alloc_zeroed(64, "Float")
+    let stb: ptr<Float> = alloc_zeroed(64, "Float")
+    let wp2: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let wg2: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let aa2: ptr<Float> = alloc_zeroed(64, "Float")
+    let bb2: ptr<Float> = alloc_zeroed(64, "Float")
+    let cc2: ptr<Float> = alloc_zeroed(64, "Float")
+    let gm2: ptr<Float> = alloc_zeroed(64, "Float")
+    var k2 = 0
+    while k2 < dim2:
+        mem_store(ptr_offset(ha, k2, "Float"), ((k2 as Float) + 1.0), "Float")
+        mem_store(ptr_offset(hb, k2, "Float"), ((k2 as Float) + 1.0), "Float")
+        mem_store(ptr_offset(gm2, k2, "Float"), 1.0 as Float, "Float")
+        k2 = k2 + 1
+    var q2 = 0
+    while q2 < sd2:
+        mem_store(ptr_offset(aa2, q2, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(bb2, q2, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(cc2, q2, "Float"), 1.0 as Float, "Float")
+        q2 = q2 + 1
+    var w2 = 0
+    while w2 < 16:
+        mem_store(ptr_offset(wp2, w2, "Byte"), 85 as Byte, "Byte")
+        mem_store(ptr_offset(wg2, w2, "Byte"), 170 as Byte, "Byte")
+        w2 = w2 + 1
+    ssm_reset(sta, sd2, dim2)
+    ssm_reset(stb, sd2, dim2)
+    fwd_layer_step(ha, tmp2, gat2, sta, wp2, wg2, aa2, bb2, cc2, gm2, 0.5, dim2, sd2, 0.000001, 0.1)
+    fwd_layer_step(hb, tmp2, gat2, stb, wp2, wg2, aa2, bb2, cc2, gm2, 0.5, dim2, sd2, 0.000001, 0.1)
+    let d0a = mem_load(ptr_offset(ha, 0, "Float"), "Float") as Float
+    let d0b = mem_load(ptr_offset(hb, 0, "Float"), "Float") as Float
+    let d7a = mem_load(ptr_offset(ha, 7, "Float"), "Float") as Float
+    let fin_a = fwd_logit_finite(d0a) and fwd_logit_finite(d7a)
+    decay ha
+    decay hb
+    decay tmp2
+    decay gat2
+    decay sta
+    decay stb
+    decay wp2
+    decay wg2
+    decay aa2
+    decay bb2
+    decay cc2
+    decay gm2
+    let dd = d0a - d0b
+    if dd < 0.0:
+        dd = 0.0 - dd
+    if dd < 0.000001 and fin_a:
+        println("  [PASS] Test 2: Layer step deterministic + finite")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 2: Layer determinism/finiteness mismatch")
+
+    // Test 3: Full sequence forward — finite, nonzero, deterministic, rows differ.
+    total = total + 1
+    let dim3 = 8
+    let sd3 = 4
+    let layers3 = 2
+    let vocab3 = 16
+    let seq3 = 4
+    let tok3: ptr<Int> = alloc_zeroed(64, "Int")
+    let tab3: ptr<Float> = alloc_zeroed(256, "Float")
+    let wp3: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let wg3: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let hw3: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let aa3: ptr<Float> = alloc_zeroed(64, "Float")
+    let bb3: ptr<Float> = alloc_zeroed(64, "Float")
+    let cc3: ptr<Float> = alloc_zeroed(64, "Float")
+    let gm3: ptr<Float> = alloc_zeroed(64, "Float")
+    let sk3: ptr<Float> = alloc_zeroed(64, "Float")
+    let st3: ptr<Float> = alloc_zeroed(128, "Float")
+    let tmp3: ptr<Float> = alloc_zeroed(64, "Float")
+    let gat3: ptr<Float> = alloc_zeroed(64, "Float")
+    let hid3: ptr<Float> = alloc_zeroed(64, "Float")
+    let lg3a: ptr<Float> = alloc_zeroed(128, "Float")
+    let lg3b: ptr<Float> = alloc_zeroed(128, "Float")
+    mem_store(ptr_offset(tok3, 0, "Int"), 1, "Int")
+    mem_store(ptr_offset(tok3, 1, "Int"), 2, "Int")
+    mem_store(ptr_offset(tok3, 2, "Int"), 3, "Int")
+    mem_store(ptr_offset(tok3, 3, "Int"), 4, "Int")
+    var f3 = 0
+    while f3 < vocab3:
+        var g3 = 0
+        while g3 < dim3:
+            mem_store(ptr_offset(tab3, f3 * dim3 + g3, "Float"), ((f3 * 10 + g3) as Float), "Float")
+            g3 = g3 + 1
+        f3 = f3 + 1
+    var u3 = 0
+    while u3 < 32:
+        mem_store(ptr_offset(wp3, u3, "Byte"), 85 as Byte, "Byte")
+        mem_store(ptr_offset(wg3, u3, "Byte"), 85 as Byte, "Byte")
+        mem_store(ptr_offset(hw3, u3, "Byte"), 85 as Byte, "Byte")
+        u3 = u3 + 1
+    var v3 = 0
+    while v3 < 8:
+        mem_store(ptr_offset(aa3, v3, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(bb3, v3, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(cc3, v3, "Float"), 1.0 as Float, "Float")
+        v3 = v3 + 1
+    var y3 = 0
+    while y3 < 16:
+        mem_store(ptr_offset(gm3, y3, "Float"), 1.0 as Float, "Float")
+        y3 = y3 + 1
+    mem_store(ptr_offset(sk3, 0, "Float"), 0.5 as Float, "Float")
+    mem_store(ptr_offset(sk3, 1, "Float"), 0.5 as Float, "Float")
+    fwd_forward_seq(lg3a, tok3, seq3, tab3, vocab3, dim3, wp3, wg3, aa3, bb3, cc3, gm3, sk3, hw3, st3, sd3, layers3, tmp3, gat3, hid3, 0.000001, 0.1)
+    fwd_forward_seq(lg3b, tok3, seq3, tab3, vocab3, dim3, wp3, wg3, aa3, bb3, cc3, gm3, sk3, hw3, st3, sd3, layers3, tmp3, gat3, hid3, 0.000001, 0.1)
+    let r00 = mem_load(ptr_offset(lg3a, 0, "Float"), "Float") as Float
+    let r10 = mem_load(ptr_offset(lg3a, 16, "Float"), "Float") as Float
+    let r00b = mem_load(ptr_offset(lg3b, 0, "Float"), "Float") as Float
+    let rlast = mem_load(ptr_offset(lg3a, 63, "Float"), "Float") as Float
+    var tabs3: Float = 0.0
+    var z3 = 0
+    while z3 < 64:
+        let zv = mem_load(ptr_offset(lg3a, z3, "Float"), "Float") as Float
+        if zv < 0.0:
+            tabs3 = tabs3 - zv
+        else:
+            tabs3 = tabs3 + zv
+        z3 = z3 + 1
+    decay tok3
+    decay tab3
+    decay wp3
+    decay wg3
+    decay hw3
+    decay aa3
+    decay bb3
+    decay cc3
+    decay gm3
+    decay sk3
+    decay st3
+    decay tmp3
+    decay gat3
+    decay hid3
+    decay lg3a
+    decay lg3b
+    let det = r00 - r00b
+    if det < 0.0:
+        det = 0.0 - det
+    let posdiff = r00 - r10
+    if posdiff < 0.0:
+        posdiff = 0.0 - posdiff
+    if det < 0.000001 and posdiff > 0.000001 and tabs3 > 0.001 and fwd_logit_finite(r00) and fwd_logit_finite(rlast):
+        println("  [PASS] Test 3: Seq forward finite+nonzero+deterministic, positions differ")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 3: Sequence forward mismatch")
+
+    // Test 4: Zero weights -> zero logits, hidden passes through (residual).
+    total = total + 1
+    let dim4 = 8
+    let sd4 = 4
+    let vocab4 = 16
+    let tok4: ptr<Int> = alloc_zeroed(64, "Int")
+    let tab4: ptr<Float> = alloc_zeroed(256, "Float")
+    let wp4: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let wg4: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let hw4: ptr<Byte> = alloc_zeroed(64, "Byte")
+    let aa4: ptr<Float> = alloc_zeroed(64, "Float")
+    let bb4: ptr<Float> = alloc_zeroed(64, "Float")
+    let cc4: ptr<Float> = alloc_zeroed(64, "Float")
+    let gm4: ptr<Float> = alloc_zeroed(64, "Float")
+    let sk4: ptr<Float> = alloc_zeroed(64, "Float")
+    let st4: ptr<Float> = alloc_zeroed(128, "Float")
+    let tmp4: ptr<Float> = alloc_zeroed(64, "Float")
+    let gat4: ptr<Float> = alloc_zeroed(64, "Float")
+    let hid4: ptr<Float> = alloc_zeroed(64, "Float")
+    let lg4: ptr<Float> = alloc_zeroed(128, "Float")
+    mem_store(ptr_offset(tok4, 0, "Int"), 5, "Int")
+    var f4 = 0
+    while f4 < vocab4:
+        var g4 = 0
+        while g4 < dim4:
+            mem_store(ptr_offset(tab4, f4 * dim4 + g4, "Float"), ((f4 * 10 + g4) as Float), "Float")
+            g4 = g4 + 1
+        f4 = f4 + 1
+    var v4 = 0
+    while v4 < 4:
+        mem_store(ptr_offset(aa4, v4, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(bb4, v4, "Float"), 1.0 as Float, "Float")
+        mem_store(ptr_offset(cc4, v4, "Float"), 1.0 as Float, "Float")
+        v4 = v4 + 1
+    var y4 = 0
+    while y4 < dim4:
+        mem_store(ptr_offset(gm4, y4, "Float"), 1.0 as Float, "Float")
+        y4 = y4 + 1
+    mem_store(ptr_offset(sk4, 0, "Float"), 0.5 as Float, "Float")
+    fwd_forward_seq(lg4, tok4, 1, tab4, vocab4, dim4, wp4, wg4, aa4, bb4, cc4, gm4, sk4, hw4, st4, sd4, 1, tmp4, gat4, hid4, 0.000001, 0.1)
+    let z0 = mem_load(ptr_offset(lg4, 0, "Float"), "Float") as Float
+    let z15 = mem_load(ptr_offset(lg4, 15, "Float"), "Float") as Float
+    let h3 = mem_load(ptr_offset(hid4, 3, "Float"), "Float") as Float
+    decay tok4
+    decay tab4
+    decay wp4
+    decay wg4
+    decay hw4
+    decay aa4
+    decay bb4
+    decay cc4
+    decay gm4
+    decay sk4
+    decay st4
+    decay tmp4
+    decay gat4
+    decay hid4
+    decay lg4
+    if z0 > -0.0001 and z0 < 0.0001 and z15 > -0.0001 and z15 < 0.0001 and h3 > 52.999 and h3 < 53.001:
+        println("  [PASS] Test 4: Zero weights -> zero logits, hidden passthrough (53.0)")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 4: Zero-weight passthrough mismatch")
+
+    // Test 5: Dimension laws + default literal contract.
+    total = total + 1
+    let l1 = fwd_dims_valid(8, 4, 2)
+    let l2 = fwd_dims_valid(7, 4, 2)
+    let l3 = fwd_dims_valid(8, 0, 2)
+    let l4 = fwd_dims_valid(8, 4, 0)
+    let l5 = fwd_seq_valid(4, 16)
+    let l6 = fwd_seq_valid(0, 16)
+    let l7 = fwd_seq_valid(4, 16385)
+    let c_v = FWD_VOCAB_MAX == 16383
+    let c_e = FWD_EPS_DEFAULT > 0.0 and FWD_EPS_DEFAULT < 0.001
+    let c_d = FWD_DT_DEFAULT > 0.0999 and FWD_DT_DEFAULT < 0.1001
+    if l1 and (l2 == false) and (l3 == false) and (l4 == false) and l5 and (l6 == false) and (l7 == false) and c_v and c_e and c_d:
+        println("  [PASS] Test 5: Dimension laws + eps/dt/vocab contract passed")
+        passed = passed + 1
+    else:
+        println("  [FAIL] Test 5: Laws/contract failed")
+
+    println("--- forward Summary: " + str(passed) + "/" + str(total) + " tests passed ---")
+    if passed == total:
+        return 0
+    return 1
+
+// ── Subsystem Entry Point & CLI ─────────────────────────────────────────────
+
+pub fn forward_usage():
+    println("k_AI_n Assembled Model Forward (forward.kn)")
+    println("USAGE:")
+    println("  core forward prove                 Run self-verifying test battery")
+    println("  core forward stats                 Print pipeline & buffer metrics")
+
+pub fn forward_stats() -> String:
+    var t = "=== k_AI_n Assembled Model Forward (A2) ===\n"
+    t = t + "  Pipeline:     embed -> layers x (ternary proj -> gamma RMSNorm\n"
+    t = t + "                -> SwiGLU gate -> SSM forward+skip -> residual add)\n"
+    t = t + "                -> ternary LM-head -> seq x vocab logits\n"
+    t = t + "  State:        layers x state_dim x dim persistent (O(1), reset/seq)\n"
+    t = t + "  Logits:       row-major seq x vocab (direct distill_loss_batch feed)\n"
+    t = t + "  Thresholds:   caller params (dispatch passes CFG_RMS_EPS/CFG_SSM_DT)\n"
+    t = t + "  Allocations:  0 in hot path (all buffers caller-owned)\n"
+    return t
+
+pub fn forward_main(args: Array<String>) -> Int with Unsafe:
+    if len(args) == 0:
+        forward_usage()
+        return 0
+    let cmd = args[0]
+    if cmd == "prove" or cmd == "test":
+        return forward_test_battery()
+    elif cmd == "stats":
+        println(forward_stats())
+        return 0
+    else:
+        forward_usage()
+        return 0
